@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""List, preview, and resume AI coding sessions for the Recall overlay.
+"""List, preview, and resume AI coding sessions for the Resume overlay.
 
 Session sources are pluggable, the same way Omarchy registers usage
 collectors. Built-in adapters cover the agents `omarchy-default-agent`
@@ -20,6 +20,7 @@ import sqlite3
 import stat
 import subprocess
 import sys
+import time
 import urllib.parse
 from pathlib import Path
 from typing import Any, Callable, Iterator
@@ -30,7 +31,7 @@ HOME = Path.home()
 USAGE_DIR = Path(os.environ.get("XDG_STATE_HOME", HOME / ".local/state")) / "omarchy" / "agents" / "usage"
 DEFAULT_AGENT_FILE = Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config")) / "omarchy" / "defaults" / "agent"
 USER_ADAPTER_DIR = Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config")) / "omarchy" / "agents" / "sessions"
-CONFIG_PATH = Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config")) / "omarchy" / "recall.json"
+CONFIG_PATH = Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config")) / "omarchy" / "resume.json"
 
 # Same roster `omarchy-default-agent` accepts. Display names match that
 # command so the overlay and the default-agent picker speak one language.
@@ -69,6 +70,7 @@ PREVIEW_TURNS = 24
 EXPORT_TURNS = 80
 EXPORT_CHARS = 4000
 HANDOFF_INLINE_CHARS = 12000
+HANDOFF_TTL_SECONDS = 24 * 60 * 60
 
 
 # ---------------------------------------------------------------------------
@@ -458,11 +460,31 @@ def command_on_path(name: str) -> bool:
 # session index (mtime-backed disk cache)
 # ---------------------------------------------------------------------------
 
+def ensure_private_dir(path: Path) -> Path:
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    try:
+        os.chmod(path, 0o700)
+    except OSError:
+        pass
+    return path
+
+
+def write_private_text(path: Path, text: str) -> None:
+    """Write text as mode 0600, ignoring umask on both create and overwrite."""
+    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+        data = text if text.endswith("\n") else text + "\n"
+        os.write(fd, data.encode("utf-8"))
+    finally:
+        os.close(fd)
+
+
 def index_path() -> Path:
-    override = os.environ.get("OMARCHY_RECALL_INDEX")
+    override = os.environ.get("OMARCHY_RESUME_INDEX")
     if override:
         return Path(override)
-    return Path(os.environ.get("XDG_CACHE_HOME", HOME / ".cache")) / "omarchy" / "recall" / "index-v1.json"
+    return Path(os.environ.get("XDG_CACHE_HOME", HOME / ".cache")) / "omarchy" / "resume" / "index-v1.json"
 
 
 class SessionIndex:
@@ -520,10 +542,14 @@ class SessionIndex:
     def save(self) -> None:
         if not self.dirty:
             return
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        ensure_private_dir(self.path.parent)
         tmp = self.path.with_suffix(".tmp")
-        tmp.write_text(json.dumps({"schemaVersion": 1, "entries": self.entries}, ensure_ascii=False) + "\n", encoding="utf-8")
+        write_private_text(tmp, json.dumps({"schemaVersion": 1, "entries": self.entries}, ensure_ascii=False))
         tmp.replace(self.path)
+        try:
+            os.chmod(self.path, 0o600)
+        except OSError:
+            pass
         self.dirty = False
 
 
@@ -1215,7 +1241,7 @@ BUILTINS: dict[str, Callable[[], Adapter]] = {
 # ---------------------------------------------------------------------------
 
 def limit_from_env() -> int:
-    raw = os.environ.get("OMARCHY_RECALL_LIMIT", "")
+    raw = os.environ.get("OMARCHY_RESUME_LIMIT", "")
     try:
         value = int(raw)
         return max(20, min(value, 1000))
@@ -1404,11 +1430,40 @@ def can_start_agent(agent_id: str, binary: str) -> bool:
     return start_command(agent_id, "x") is not None and command_on_path(binary)
 
 
-def handoff_path(source: str, session_id: str) -> Path:
-    cache = Path(os.environ.get("XDG_CACHE_HOME", HOME / ".cache")) / "omarchy" / "recall"
-    cache.mkdir(parents=True, exist_ok=True)
+def handoff_dir() -> Path:
+    return Path(os.environ.get("XDG_CACHE_HOME", HOME / ".cache")) / "omarchy" / "resume" / "handoffs"
+
+
+def prune_handoffs(directory: Path, now: float | None = None) -> None:
+    cutoff = (time.time() if now is None else now) - HANDOFF_TTL_SECONDS
+    try:
+        children = list(directory.iterdir())
+    except OSError:
+        return
+    for path in children:
+        try:
+            if not path.is_file():
+                continue
+            if path.stat().st_mtime < cutoff:
+                path.unlink()
+        except OSError:
+            continue
+
+
+def write_handoff(source: str, session_id: str, text: str) -> Path:
+    directory = ensure_private_dir(handoff_dir())
+    prune_handoffs(directory)
+    # Older builds wrote transcripts next to the index with default umask.
+    legacy = directory.parent
+    try:
+        for leftover in legacy.glob("*-*.md"):
+            leftover.unlink()
+    except OSError:
+        pass
     safe = "".join(ch if ch.isalnum() or ch in "-_" else "-" for ch in session_id)[:48]
-    return cache / f"{source}-{safe}.md"
+    path = directory / f"{source}-{safe}.md"
+    write_private_text(path, text)
+    return path
 
 
 def compose_handoff(session: dict[str, Any], transcript: str) -> str:
@@ -1646,8 +1701,7 @@ def open_command(args: argparse.Namespace) -> int:
         return 1
     handoff = compose_handoff(session, transcript)
     if len(handoff) > HANDOFF_INLINE_CHARS:
-        path = handoff_path(args.source, args.id)
-        path.write_text(handoff, encoding="utf-8")
+        path = write_handoff(args.source, args.id, handoff)
         prompt = compose_file_prompt(path, session)
     else:
         prompt = handoff
@@ -1687,7 +1741,7 @@ def sources_command(_args: argparse.Namespace) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="recall", description="List and resume AI coding sessions")
+    parser = argparse.ArgumentParser(prog="resume", description="List and resume AI coding sessions")
     sub = parser.add_subparsers(dest="command", required=True)
 
     listing = sub.add_parser("list", help="print sessions as JSON")

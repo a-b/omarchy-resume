@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
-  "id": "thomas.recall",
-  "name": "Recall",
+  "id": "thomas.resume",
+  "name": "Resume AI Session",
   "version": "1.1.0",
   "author": "Thomas Anagrius",
   "license": "MIT",

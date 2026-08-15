@@ -7,6 +7,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -14,8 +15,8 @@ from pathlib import Path
 from importlib.machinery import SourceFileLoader
 
 PLUGIN = Path(__file__).resolve().parents[1]
-RECALL = PLUGIN / "bin" / "recall"
-R = SourceFileLoader("omarchy_recall", str(RECALL)).load_module()
+RESUME = PLUGIN / "bin" / "resume"
+R = SourceFileLoader("omarchy_resume", str(RESUME)).load_module()
 
 
 class ProjectResolveTest(unittest.TestCase):
@@ -82,11 +83,38 @@ class ProjectResolveTest(unittest.TestCase):
             self.assertEqual(extra_label, "ivory-tower")
 
 
+class PrivateFileTest(unittest.TestCase):
+    def test_write_private_text_is_owner_only(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            path = Path(raw) / "secret.md"
+            old = os.umask(0o022)
+            try:
+                R.write_private_text(path, "private transcript")
+            finally:
+                os.umask(old)
+            mode = path.stat().st_mode
+            self.assertEqual(stat.S_IMODE(mode), 0o600)
+            self.assertEqual(path.read_text(encoding="utf-8"), "private transcript\n")
+
+    def test_prune_handoffs_removes_stale_files(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            directory = Path(raw)
+            fresh = directory / "fresh.md"
+            stale = directory / "stale.md"
+            fresh.write_text("new\n", encoding="utf-8")
+            stale.write_text("old\n", encoding="utf-8")
+            old = time.time() - R.HANDOFF_TTL_SECONDS - 10
+            os.utime(stale, (old, old))
+            R.prune_handoffs(directory)
+            self.assertTrue(fresh.is_file())
+            self.assertFalse(stale.exists())
+
+
 class SessionIndexTest(unittest.TestCase):
     def test_unchanged_file_is_not_reread(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
-            os.environ["OMARCHY_RECALL_INDEX"] = str(root / "index.json")
+            os.environ["OMARCHY_RESUME_INDEX"] = str(root / "index.json")
             os.environ["CLAUDE_CONFIG_DIR"] = str(root / "claude")
             R.reset_index()
             project = root / "claude" / "projects" / "-tmp-demo"
@@ -104,7 +132,7 @@ class SessionIndexTest(unittest.TestCase):
             R.reset_index()
             second = R.ClaudeAdapter().list_sessions(10)
             self.assertEqual(second[0]["title"], "first title")
-            del os.environ["OMARCHY_RECALL_INDEX"]
+            del os.environ["OMARCHY_RESUME_INDEX"]
             del os.environ["CLAUDE_CONFIG_DIR"]
             R.reset_index()
 
@@ -240,10 +268,10 @@ class LaunchDirTest(unittest.TestCase):
 class CliSmokeTest(unittest.TestCase):
     def test_sources_command(self) -> None:
         env = os.environ.copy()
-        env["CLAUDE_CONFIG_DIR"] = "/tmp/recall-missing-claude"
-        env["CODEX_HOME"] = "/tmp/recall-missing-codex"
-        env["GROK_HOME"] = "/tmp/recall-missing-grok"
-        proc = subprocess.run([str(RECALL), "sources"], check=False, capture_output=True, text=True, env=env)
+        env["CLAUDE_CONFIG_DIR"] = "/tmp/resume-missing-claude"
+        env["CODEX_HOME"] = "/tmp/resume-missing-codex"
+        env["GROK_HOME"] = "/tmp/resume-missing-grok"
+        proc = subprocess.run([str(RESUME), "sources"], check=False, capture_output=True, text=True, env=env)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         data = json.loads(proc.stdout)
         self.assertEqual(data["schemaVersion"], 1)

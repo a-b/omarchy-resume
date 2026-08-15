@@ -4,7 +4,7 @@ import Quickshell.Wayland
 import QtQuick
 import qs.Commons
 import qs.Ui
-import "Model.js" as Recall
+import "Model.js" as Resume
 
 Item {
   id: root
@@ -13,8 +13,8 @@ Item {
   property var manifest: null
   property string omarchyPath: Quickshell.env("OMARCHY_PATH")
 
-  readonly property string pluginDir: manifest && manifest.__sourceDir ? String(manifest.__sourceDir) : (Quickshell.env("HOME") + "/.config/omarchy/plugins/thomas.recall")
-  readonly property string recallBin: pluginDir + "/bin/recall"
+  readonly property string pluginDir: manifest && manifest.__sourceDir ? String(manifest.__sourceDir) : (Quickshell.env("HOME") + "/.config/omarchy/plugins/thomas.resume")
+  readonly property string resumeBin: pluginDir + "/bin/resume"
 
   property bool opened: false
   property bool loading: false
@@ -32,7 +32,7 @@ Item {
   property string statusText: ""
   property double nowMs: Date.now()
 
-  property var payload: Recall.emptyPayload()
+  property var payload: Resume.emptyPayload()
   property var sessions: []
 
   property color background: Color.menu.background
@@ -53,7 +53,7 @@ Item {
   property int rowHeight: Math.max(Style.space(52), Style.font.title + Style.font.bodySmall + Style.spacing.rowPaddingX * 2)
 
   function open(payloadJson) {
-    var incoming = Recall.parseOpenPayload(payloadJson)
+    var incoming = Resume.parseOpenPayload(payloadJson)
     root.opened = true
     root.filterText = incoming.query
     root.sourceFilter = incoming.source
@@ -80,7 +80,7 @@ Item {
   function dismiss() {
     root.close()
     if (root.shell && typeof root.shell.hide === "function")
-      root.shell.hide((root.manifest && root.manifest.id) || "thomas.recall")
+      root.shell.hide((root.manifest && root.manifest.id) || "thomas.resume")
   }
 
   function toggle() {
@@ -96,7 +96,7 @@ Item {
   }
 
   function applyPayload(raw) {
-    var data = Recall.parsePayload(raw)
+    var data = Resume.parsePayload(raw)
     var sources = data.sources || []
     for (var i = 0; i < data.sessions.length; i++) {
       var session = data.sessions[i]
@@ -138,14 +138,14 @@ Item {
   }
 
   function rebuildDisplay() {
-    var filtered = Recall.filterSessions(root.payload.sessions, root.filterText, root.sourceFilter)
+    var filtered = Resume.filterSessions(root.payload.sessions, root.filterText, root.sourceFilter)
     root.sessions = filtered
 
     displayModel.clear()
 
     var rows = []
     for (var i = 0; i < filtered.length; i++) {
-      var flat = Recall.flattenSession(filtered[i], root.nowMs)
+      var flat = Resume.flattenSession(filtered[i], root.nowMs)
       rows.push({
         sessionId: flat.sessionId,
         source: flat.source,
@@ -316,7 +316,7 @@ Item {
   function resumeSession(source, sessionId) {
     if (!source || !sessionId) return
     root.dismiss()
-    Quickshell.execDetached([root.recallBin, "resume", source, sessionId])
+    Quickshell.execDetached([root.resumeBin, "resume", source, sessionId])
   }
 
   function copySession() {
@@ -344,7 +344,7 @@ Item {
   function rebuildTargets() {
     targetModel.clear()
     var row = root.currentRow()
-    var pack = Recall.handoffTargets(root.payload.sources || [], row ? row.source : "")
+    var pack = Resume.handoffTargets(root.payload.sources || [], row ? row.source : "")
     for (var i = 0; i < pack.targets.length; i++) {
       var target = pack.targets[i]
       targetModel.append({
@@ -385,7 +385,7 @@ Item {
     var row = root.currentRow()
     if (!row || !agentId) return
     root.dismiss()
-    Quickshell.execDetached([root.recallBin, "open", row.source, row.sessionId, "--agent", agentId])
+    Quickshell.execDetached([root.resumeBin, "open", row.source, row.sessionId, "--agent", agentId])
   }
 
   function currentRow() {
@@ -399,7 +399,7 @@ Item {
 
   FileView {
     id: groupByFile
-    path: Quickshell.env("HOME") + "/.config/omarchy/recall.json"
+    path: Quickshell.env("HOME") + "/.config/omarchy/resume.json"
     watchChanges: true
     atomicWrites: true
     printErrors: false
@@ -422,7 +422,7 @@ Item {
   Process {
     id: listProc
     command: {
-      var args = [root.recallBin, "list", "--limit", "240"]
+      var args = [root.resumeBin, "list", "--limit", "240"]
       if (root.cwdFilter) { args.push("--cwd"); args.push(root.cwdFilter) }
       return args
     }
@@ -454,7 +454,7 @@ Item {
     command: {
       var row = root.currentRow()
       if (!row) return ["true"]
-      return [root.recallBin, "preview", row.source, row.sessionId]
+      return [root.resumeBin, "preview", row.source, row.sessionId]
     }
     stdout: StdioCollector {
       waitForEnd: true
@@ -473,7 +473,7 @@ Item {
     command: {
       var row = root.currentRow()
       if (!row) return ["true"]
-      return [root.recallBin, "copy", row.source, row.sessionId]
+      return [root.resumeBin, "copy", row.source, row.sessionId]
     }
     stdout: StdioCollector {
       waitForEnd: true
@@ -492,7 +492,7 @@ Item {
     visible: root.opened
     anchors { top: true; bottom: true; left: true; right: true }
     color: "transparent"
-    WlrLayershell.namespace: "thomas-recall"
+    WlrLayershell.namespace: "thomas-resume"
     WlrLayershell.layer: WlrLayer.Overlay
     WlrLayershell.keyboardFocus: WlrKeyboardFocus.Exclusive
     exclusionMode: ExclusionMode.Ignore

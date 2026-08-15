@@ -1,4 +1,4 @@
-# Recall
+# Resume AI Session
 
 A centered, telescope-style overlay for Omarchy that finds past AI coding
 sessions and opens the one you pick in a terminal. `preview.png` is the
@@ -23,11 +23,11 @@ the same way.
 Summon it:
 
 ```
-omarchy-shell shell toggle thomas.recall
+omarchy-shell shell toggle thomas.resume
 ```
 
 Or press Super+Alt+A after the binding below is in place. The Omarchy menu
-gains a **Trigger > Recall session** entry as well.
+gains a **Trigger > Resume AI Session** entry as well.
 
 ## Why it hooks into Omarchy agents
 
@@ -39,8 +39,8 @@ Omarchy already has a registration path for coding agents:
 - `omarchy agent` launches the chosen CLI with the right “don't stop to ask”
   flags and the shared `org.omarchy.agent` window class
 
-Recall reads those same records for display names and resumes with the same
-launch flags so a recalled session behaves like one started from the
+Resume AI Session reads those same records for display names and resumes with
+the same launch flags so a resumed session behaves like one started from the
 keybinding.
 
 Adding an agent to the picker is the same move as adding one to the usage
@@ -49,8 +49,8 @@ panel: ship a collector. For sessions, the collector is named
 
 ## Adapter contract
 
-Recall discovers session sources in this order. A later match with the same
-id wins, so a user adapter can replace a bundled one.
+The overlay discovers session sources in this order. A later match with the
+same id wins, so a user adapter can replace a bundled one.
 
 1. Built-in adapters for Claude, Codex, Grok, OpenCode, and Pi
 2. `~/.config/omarchy/agents/sessions/<id>` (next to agent config such as
@@ -82,7 +82,7 @@ Each session is:
 
 `preview` prints the transcript as plain text.
 
-`resume` prints the launch plan, then Recall opens it in a terminal:
+`resume` prints the launch plan, then the overlay opens it in a terminal:
 
 ```json
 {
@@ -94,7 +94,7 @@ Each session is:
 See `examples/omarchy-agent-sessions-example` for a complete adapter. World-writable
 files are ignored.
 
-Optional config lives at `~/.config/omarchy/recall.json`:
+Optional config lives at `~/.config/omarchy/resume.json`:
 
 ```json
 {
@@ -131,42 +131,43 @@ Copy puts a pasteable handoff on the clipboard: title, original agent,
 directory, and the conversation labeled User / Assistant. Open-in starts a
 *new* session in another installed agent (the same launch flags as
 `omarchy agent`) in the original working directory. A short transcript is
-passed as the first prompt; a long one is written to
-`~/.cache/omarchy/recall/` and the new agent is asked to read that file.
+passed as the first prompt; a long one is written owner-only (mode 0600) to
+`~/.cache/omarchy/resume/handoffs/` and removed after 24 hours. The new agent
+is asked to read that file.
 This is not a converted native session — it is a clean continuation prompt.
 
 ```
-recall copy grok <session-id>
-recall open grok <session-id> --agent claude
+resume copy grok <session-id>
+resume open grok <session-id> --agent claude
 ```
 
 The overlay accepts a JSON payload, so other plugins can open it already
 narrowed:
 
 ```
-omarchy-shell shell summon thomas.recall '{"source":"grok","cwd":"/home/you/code/app"}'
+omarchy-shell shell summon thomas.resume '{"source":"grok","cwd":"/home/you/code/app"}'
 ```
 
 ## Install
 
 ```
-omarchy plugin add https://github.com/anagrius/omarchy-recall.git --enable
+omarchy plugin add https://github.com/anagrius/omarchy-resume.git --enable
 ```
 
 Summon it with:
 
 ```
-omarchy-shell shell toggle thomas.recall
+omarchy-shell shell toggle thomas.resume
 ```
 
 Optional Super+Alt+A binding in `~/.config/hypr/bindings.lua`:
 
 ```
-o.bind("SUPER + ALT + A", "Recall session", "omarchy-shell shell toggle thomas.recall")
+o.bind("SUPER + ALT + A", "Resume AI Session", "omarchy-shell shell toggle thomas.resume")
 ```
 
 ## Remove
 
 ```
-omarchy plugin remove thomas.recall
+omarchy plugin remove thomas.resume
 ```
