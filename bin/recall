@@ -1,0 +1,1744 @@
+#!/usr/bin/env python3
+"""List, preview, and resume AI coding sessions for the Recall overlay.
+
+Session sources are pluggable, the same way Omarchy registers usage
+collectors. Built-in adapters cover the agents `omarchy-default-agent`
+knows about. A third-party agent appears automatically when someone
+ships an executable named `omarchy-agent-sessions-<id>` on PATH, or
+drops one in `~/.config/omarchy/agents/sessions/<id>`.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import os
+import re
+import shutil
+import sqlite3
+import stat
+import subprocess
+import sys
+import urllib.parse
+from pathlib import Path
+from typing import Any, Callable, Iterator
+
+
+PLUGIN_DIR = Path(__file__).resolve().parent.parent
+HOME = Path.home()
+USAGE_DIR = Path(os.environ.get("XDG_STATE_HOME", HOME / ".local/state")) / "omarchy" / "agents" / "usage"
+DEFAULT_AGENT_FILE = Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config")) / "omarchy" / "defaults" / "agent"
+USER_ADAPTER_DIR = Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config")) / "omarchy" / "agents" / "sessions"
+CONFIG_PATH = Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config")) / "omarchy" / "recall.json"
+
+# Same roster `omarchy-default-agent` accepts. Display names match that
+# command so the overlay and the default-agent picker speak one language.
+REGISTERED_AGENTS: dict[str, dict[str, str]] = {
+    "claude": {"name": "Claude Code", "binary": "claude"},
+    "codex": {"name": "Codex", "binary": "codex"},
+    "grok": {"name": "Grok", "binary": "grok"},
+    "opencode": {"name": "OpenCode", "binary": "opencode"},
+    "pi": {"name": "Pi", "binary": "pi"},
+    "omp": {"name": "Oh My Pi", "binary": "omp"},
+    "gemini": {"name": "Gemini", "binary": "gemini"},
+    "copilot": {"name": "GitHub Copilot", "binary": "copilot"},
+    "crush": {"name": "Crush", "binary": "crush"},
+    "cursor": {"name": "Cursor", "binary": "cursor-agent"},
+}
+
+# Launch flags copied from omarchy-agent so a resumed session does not
+# stop to ask the first time the way a keybinding-launched one would.
+RESUME_PREFIX: dict[str, list[str]] = {
+    "claude": ["claude", "--permission-mode", "bypassPermissions", "--resume"],
+    "codex": ["codex", "--dangerously-bypass-approvals-and-sandbox", "resume"],
+    "grok": ["grok", "--permission-mode", "bypassPermissions", "--resume"],
+    "opencode": ["opencode", "--auto", "resume"],
+    "pi": ["pi", "--session"],
+    "omp": ["omp", "--auto-approve", "--session"],
+    "gemini": ["gemini", "--yolo"],
+    "copilot": ["copilot", "--allow-all"],
+    "crush": ["crush", "--yolo"],
+    "cursor": ["cursor-agent", "--resume"],
+}
+
+DEFAULT_LIMIT = 200
+SNIPPET_LEN = 160
+TITLE_LEN = 88
+PREVIEW_TURNS = 24
+EXPORT_TURNS = 80
+EXPORT_CHARS = 4000
+HANDOFF_INLINE_CHARS = 12000
+
+
+# ---------------------------------------------------------------------------
+# small helpers
+# ---------------------------------------------------------------------------
+
+def expand(value: str) -> Path:
+    return Path(os.path.expandvars(os.path.expanduser(value))).expanduser()
+
+
+def which(name: str) -> str | None:
+    return shutil.which(name)
+
+
+def read_json(path: Path) -> Any:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def iter_jsonl(path: Path, max_lines: int = 0, max_bytes: int = 0) -> Iterator[Any]:
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as handle:
+            seen = 0
+            read = 0
+            for line in handle:
+                if max_bytes and read >= max_bytes:
+                    break
+                read += len(line)
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    yield json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                seen += 1
+                if max_lines and seen >= max_lines:
+                    break
+    except OSError:
+        return
+
+
+def mtime_iso(path: Path) -> tuple[int, str]:
+    try:
+        stamp = int(path.stat().st_mtime)
+    except OSError:
+        stamp = 0
+    return stamp, dt.datetime.fromtimestamp(stamp, tz=dt.timezone.utc).isoformat()
+
+
+def parse_iso_ms(value: Any) -> int:
+    if value is None:
+        return 0
+    if isinstance(value, (int, float)):
+        number = float(value)
+        if number > 10_000_000_000:
+            return int(number)
+        return int(number * 1000) if number > 1_000_000_000 else int(number)
+    text = str(value).strip()
+    if not text:
+        return 0
+    try:
+        parsed = dt.datetime.fromisoformat(text.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=dt.timezone.utc)
+        return int(parsed.timestamp() * 1000)
+    except ValueError:
+        return 0
+
+
+def collapse(text: str) -> str:
+    return " ".join(str(text).replace("\x00", " ").split())
+
+
+def clip(text: str, limit: int) -> str:
+    text = collapse(text)
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 1)].rstrip() + "…"
+
+
+def extract_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (int, float, bool)):
+        return str(value)
+    if isinstance(value, list):
+        parts = [extract_text(item) for item in value]
+        return "\n".join(part for part in parts if part)
+    if isinstance(value, dict):
+        for key in ("text", "content", "input_text", "output_text", "message"):
+            if key in value:
+                inner = extract_text(value[key])
+                if inner:
+                    return inner
+        if value.get("type") in {"input_text", "output_text", "text", "output_text"}:
+            return extract_text(value.get("text") or value.get("content"))
+    return ""
+
+
+def looks_like_system(text: str) -> bool:
+    stripped = text.lstrip()
+    return stripped.startswith(("<system-reminder>", "<user_info>", "<environment_context>", "You are Grok", "You are Claude"))
+
+
+def tidy_preview(text: str) -> str:
+    text = re.sub(r"</?user_query>", "", text)
+    text = re.sub(r"</?user_info>[\s\S]*?</user_info>", "", text)
+    text = re.sub(r"</?system-reminder>[\s\S]*?</system-reminder>", "", text)
+    return collapse(text) if "\n" not in text else text.strip()
+
+
+def project_from_cwd(cwd: str) -> str:
+    if not cwd:
+        return ""
+    path = Path(cwd)
+    return path.name or str(path)
+
+
+def display_path(path: Path) -> str:
+    try:
+        resolved = path.resolve()
+    except OSError:
+        resolved = path
+    home = HOME.resolve()
+    try:
+        relative = resolved.relative_to(home)
+        return "~" if str(relative) == "." else f"~/{relative}"
+    except ValueError:
+        return str(resolved)
+
+
+def git_main_worktree(git_file: Path) -> Path | None:
+    try:
+        text = git_file.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    gitdir = None
+    for line in text.splitlines():
+        if line.lower().startswith("gitdir:"):
+            raw = line.split(":", 1)[1].strip()
+            gitdir = Path(raw)
+            if not gitdir.is_absolute():
+                gitdir = (git_file.parent / gitdir).resolve()
+            break
+    if gitdir is None:
+        return None
+    if gitdir.parent.name == "worktrees":
+        return gitdir.parent.parent.parent
+    commondir = gitdir / "commondir"
+    try:
+        common = Path(commondir.read_text(encoding="utf-8").strip())
+        if not common.is_absolute():
+            common = (gitdir / common).resolve()
+        if common.name == ".git":
+            return common.parent
+        if common.is_dir() and (common / "HEAD").exists():
+            return common.parent if common.name == ".git" else common
+    except OSError:
+        pass
+    if gitdir.name == ".git":
+        return gitdir.parent
+    return None
+
+
+def jj_main_workspace(jj_dir: Path) -> Path | None:
+    repo = jj_dir / "repo"
+    if repo.is_dir():
+        return jj_dir.parent
+    if repo.is_file():
+        try:
+            target = Path(repo.read_text(encoding="utf-8", errors="replace").strip())
+        except OSError:
+            return None
+        if not target.is_absolute():
+            target = (repo.parent / target).resolve()
+        else:
+            target = target.resolve()
+        if target.name == "repo" and target.parent.name == ".jj":
+            return target.parent.parent
+        return target
+    return jj_dir.parent
+
+
+def infer_from_worktrees_path(start: Path) -> Path | None:
+    """Herdr (and similar) worktrees live at .../worktrees/<project>/<name>.
+
+    After the worktree directory is deleted the .git pointer is gone, but
+    the path still names the project. Prefer a live sibling worktree's
+    pointer, then ~/code/<project>.
+    """
+    parts = start.parts
+    if "worktrees" not in parts:
+        return None
+    idx = parts.index("worktrees")
+    if idx + 1 >= len(parts):
+        return None
+    project = parts[idx + 1]
+    wt_root = Path(*parts[: idx + 2])
+    if wt_root.is_dir():
+        try:
+            children = list(wt_root.iterdir())
+        except OSError:
+            children = []
+        for child in children:
+            git = child / ".git"
+            if git.is_file():
+                main = git_main_worktree(git)
+                if main is not None:
+                    return main
+            if git.is_dir():
+                return child
+            jj = child / ".jj"
+            if jj.exists():
+                return jj_main_workspace(jj) or child
+    for candidate in (HOME / "code" / project, HOME / "Work" / project, HOME / project):
+        if (candidate / ".git").exists() or (candidate / ".jj").exists():
+            return candidate
+    return None
+
+
+_project_cache: dict[str, tuple[str, str]] = {}
+
+
+def resolve_project(cwd: str) -> tuple[str, str]:
+    """Group worktrees/workspaces of one repo together.
+
+    Returns (stable_key, display_label). Git worktrees collapse to the
+    primary checkout; jj workspaces collapse to the workspace that owns
+    `.jj/repo` as a directory. Paths with neither stay as themselves.
+    """
+    if not cwd:
+        return ("", "No folder")
+    try:
+        start = Path(cwd).expanduser()
+        try:
+            start = start.resolve()
+        except OSError:
+            pass
+    except (OSError, RuntimeError):
+        return (cwd, cwd)
+
+    cache_key = str(start)
+    cached = _project_cache.get(cache_key)
+    if cached:
+        return cached
+
+    current = start if start.is_dir() else start.parent
+    found: Path | None = None
+    kind = ""
+    while True:
+        if (current / ".git").exists():
+            found, kind = current, "git"
+            break
+        if (current / ".jj").exists():
+            found, kind = current, "jj"
+            break
+        parent = current.parent
+        if parent == current:
+            break
+        current = parent
+
+    if found is None:
+        inferred = infer_from_worktrees_path(start)
+        if inferred is not None:
+            found, kind = inferred, "path"
+        else:
+            result = (str(start), display_path(start))
+            _project_cache[cache_key] = result
+            return result
+
+    if kind == "path":
+        try:
+            found = found.resolve()
+        except OSError:
+            pass
+        result = (str(found), found.name or display_path(found))
+        _project_cache[cache_key] = result
+        return result
+
+    main = found
+    if kind == "git":
+        git = found / ".git"
+        if git.is_file():
+            main = git_main_worktree(git) or found
+    else:
+        main = jj_main_workspace(found / ".jj") or found
+
+    try:
+        main = main.resolve()
+    except OSError:
+        pass
+    result = (str(main), main.name or display_path(main))
+    _project_cache[cache_key] = result
+    return result
+
+
+def decode_dashed_path(name: str) -> str:
+    if not name:
+        return ""
+    text = urllib.parse.unquote(name)
+    if text.startswith("--") and text.endswith("--"):
+        inner = text[2:-2]
+        return "/" + inner.replace("-", "/")
+    if text.startswith("-"):
+        return "/" + text[1:].replace("-", "/")
+    if text.startswith("%2F") or text.startswith("/"):
+        return urllib.parse.unquote(text)
+    return text
+
+
+def session_record(
+    *,
+    source: str,
+    session_id: str,
+    title: str,
+    cwd: str = "",
+    updated_ms: int = 0,
+    updated_at: str = "",
+    model: str = "",
+    message_count: int = 0,
+    snippet: str = "",
+    source_path: str = "",
+) -> dict[str, Any]:
+    title = clip(title or "Untitled session", TITLE_LEN) or "Untitled session"
+    snippet = clip(snippet or title, SNIPPET_LEN)
+    if not updated_at and updated_ms:
+        updated_at = dt.datetime.fromtimestamp(updated_ms / 1000, tz=dt.timezone.utc).isoformat()
+    if not updated_ms and updated_at:
+        updated_ms = parse_iso_ms(updated_at)
+    project_key, project_label = resolve_project(cwd)
+    return {
+        "id": session_id,
+        "source": source,
+        "title": title,
+        "cwd": cwd,
+        "project": project_label,
+        "projectKey": project_key,
+        "projectLabel": project_label,
+        "updatedAt": updated_at,
+        "updatedAtMs": int(updated_ms),
+        "model": model,
+        "messageCount": int(message_count or 0),
+        "snippet": snippet,
+        "sourcePath": source_path,
+    }
+
+
+def load_config() -> dict[str, Any]:
+    data = read_json(CONFIG_PATH)
+    return data if isinstance(data, dict) else {}
+
+
+# ---------------------------------------------------------------------------
+# Omarchy registration
+# ---------------------------------------------------------------------------
+
+def default_agent() -> str:
+    try:
+        return DEFAULT_AGENT_FILE.read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
+def usage_records() -> dict[str, dict[str, Any]]:
+    records: dict[str, dict[str, Any]] = {}
+    if not USAGE_DIR.is_dir():
+        return records
+    for path in USAGE_DIR.glob("*.json"):
+        data = read_json(path)
+        if not isinstance(data, dict):
+            continue
+        agent_id = str(data.get("id") or path.stem)
+        records[agent_id] = data
+    return records
+
+
+def command_on_path(name: str) -> bool:
+    return which(name) is not None
+
+
+# ---------------------------------------------------------------------------
+# session index (mtime-backed disk cache)
+# ---------------------------------------------------------------------------
+
+def index_path() -> Path:
+    override = os.environ.get("OMARCHY_RECALL_INDEX")
+    if override:
+        return Path(override)
+    return Path(os.environ.get("XDG_CACHE_HOME", HOME / ".cache")) / "omarchy" / "recall" / "index-v1.json"
+
+
+class SessionIndex:
+    def __init__(self, path: Path):
+        self.path = path
+        self.entries: dict[str, dict[str, Any]] = {}
+        self.dirty = False
+        self._load()
+
+    def _load(self) -> None:
+        data = read_json(self.path)
+        if not isinstance(data, dict) or data.get("schemaVersion") != 1:
+            return
+        entries = data.get("entries")
+        if isinstance(entries, dict):
+            self.entries = entries
+
+    def get(self, path: Path) -> list[dict[str, Any]] | None:
+        try:
+            stat_result = path.stat()
+        except OSError:
+            return None
+        hit = self.entries.get(str(path))
+        if not isinstance(hit, dict):
+            return None
+        if hit.get("mtimeNs") != stat_result.st_mtime_ns or hit.get("size") != stat_result.st_size:
+            return None
+        sessions = hit.get("sessions")
+        return sessions if isinstance(sessions, list) else None
+
+    def put(self, path: Path, source: str, sessions: list[dict[str, Any]]) -> None:
+        try:
+            stat_result = path.stat()
+        except OSError:
+            return
+        self.entries[str(path)] = {
+            "mtimeNs": stat_result.st_mtime_ns,
+            "size": stat_result.st_size,
+            "source": source,
+            "sessions": sessions,
+        }
+        self.dirty = True
+
+    def prune(self, source: str, live_paths: set[str]) -> None:
+        drop = [
+            key for key, value in self.entries.items()
+            if isinstance(value, dict) and value.get("source") == source and key not in live_paths
+        ]
+        if not drop:
+            return
+        for key in drop:
+            del self.entries[key]
+        self.dirty = True
+
+    def save(self) -> None:
+        if not self.dirty:
+            return
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.path.with_suffix(".tmp")
+        tmp.write_text(json.dumps({"schemaVersion": 1, "entries": self.entries}, ensure_ascii=False) + "\n", encoding="utf-8")
+        tmp.replace(self.path)
+        self.dirty = False
+
+
+_INDEX: SessionIndex | None = None
+
+
+def session_index() -> SessionIndex:
+    global _INDEX
+    if _INDEX is None:
+        _INDEX = SessionIndex(index_path())
+    return _INDEX
+
+
+def reset_index() -> None:
+    global _INDEX
+    _INDEX = SessionIndex(index_path())
+
+
+def cached_list(adapter: Adapter, limit: int) -> list[dict[str, Any]]:
+    files: list[tuple[float, Path]] = []
+    live: set[str] = set()
+    for path in adapter.index_files():
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            continue
+        live.add(str(path))
+        files.append((mtime, path))
+    files.sort(key=lambda item: item[0], reverse=True)
+
+    index = session_index()
+    out: list[dict[str, Any]] = []
+    for _, path in files:
+        sessions = index.get(path)
+        if sessions is None:
+            sessions = adapter.summarize_file(path)
+            if sessions is None:
+                sessions = []
+            elif isinstance(sessions, dict):
+                sessions = [sessions]
+            index.put(path, adapter.id, sessions)
+        for session in sessions:
+            if isinstance(session, dict) and session.get("id"):
+                out.append(session)
+        if len(out) >= limit:
+            break
+    index.prune(adapter.id, live)
+    return out[:limit]
+
+
+# ---------------------------------------------------------------------------
+# built-in adapters
+# ---------------------------------------------------------------------------
+
+class Adapter:
+    id = ""
+    name = ""
+    binary = ""
+
+    def present(self) -> bool:
+        return False
+
+    def index_files(self) -> list[Path]:
+        return []
+
+    def summarize_file(self, path: Path) -> list[dict[str, Any]] | dict[str, Any] | None:
+        return None
+
+    def list_sessions(self, limit: int) -> list[dict[str, Any]]:
+        return cached_list(self, limit)
+
+    def preview(self, session_id: str, *, max_turns: int = PREVIEW_TURNS, max_chars: int = 1200) -> str:
+        return ""
+
+    def export(self, session_id: str) -> str:
+        return self.preview(session_id, max_turns=EXPORT_TURNS, max_chars=EXPORT_CHARS)
+
+    def resume_plan(self, session_id: str) -> dict[str, Any] | None:
+        prefix = list(RESUME_PREFIX.get(self.id, [self.binary]))
+        session = None
+        for item in self.list_sessions(max(limit_from_env(), 400)):
+            if item["id"] == session_id:
+                session = item
+                break
+        if session is None:
+            session = {"id": session_id, "cwd": str(HOME)}
+        command = prefix + [session_id]
+        return {"command": command, "cwd": session.get("cwd") or str(HOME), "id": session_id}
+
+
+class ClaudeAdapter(Adapter):
+    id = "claude"
+    name = "Claude Code"
+    binary = "claude"
+
+    def root(self) -> Path:
+        return expand(os.environ.get("CLAUDE_CONFIG_DIR") or "~/.claude")
+
+    def present(self) -> bool:
+        return (self.root() / "projects").is_dir()
+
+    def index_files(self) -> list[Path]:
+        projects = self.root() / "projects"
+        if not projects.is_dir():
+            return []
+        return list(projects.glob("*/*.jsonl"))
+
+    def summarize_file(self, path: Path) -> list[dict[str, Any]] | None:
+        record = self._summarize(path)
+        return [record] if record else []
+
+    def _summarize(self, path: Path) -> dict[str, Any] | None:
+        session_id = path.stem
+        cwd = decode_dashed_path(path.parent.name)
+        title = ""
+        model = ""
+        count = 0
+        for obj in iter_jsonl(path, max_lines=80, max_bytes=96_000):
+            if not isinstance(obj, dict):
+                continue
+            session_id = str(obj.get("sessionId") or session_id)
+            cwd = str(obj.get("cwd") or cwd)
+            kind = obj.get("type")
+            if kind == "user":
+                text = extract_text(obj.get("message") or obj)
+                if text and not looks_like_system(text) and not title:
+                    title = text
+                if text:
+                    count += 1
+            elif kind == "assistant":
+                count += 1
+                if not model:
+                    message = obj.get("message") if isinstance(obj.get("message"), dict) else {}
+                    model = str(message.get("model") or obj.get("model") or "")
+        stamp, iso = mtime_iso(path)
+        if not title:
+            title = project_from_cwd(cwd) or session_id
+        return session_record(
+            source=self.id,
+            session_id=session_id,
+            title=title,
+            cwd=cwd,
+            updated_ms=stamp * 1000,
+            updated_at=iso,
+            model=model,
+            message_count=count,
+            snippet=title,
+            source_path=str(path),
+        )
+
+    def preview(self, session_id: str, *, max_turns: int = PREVIEW_TURNS, max_chars: int = 1200) -> str:
+        path = self._path_for(session_id)
+        if path is None:
+            return ""
+        turns: list[tuple[str, str]] = []
+        for obj in iter_jsonl(path, max_lines=400, max_bytes=400_000):
+            if not isinstance(obj, dict):
+                continue
+            kind = obj.get("type")
+            if kind not in {"user", "assistant"}:
+                continue
+            text = extract_text(obj.get("message") or obj)
+            if not text or looks_like_system(text):
+                continue
+            turns.append((kind, text))
+        return format_turns(turns, max_turns=max_turns, max_chars=max_chars)
+
+    def _path_for(self, session_id: str) -> Path | None:
+        projects = self.root() / "projects"
+        if not projects.is_dir():
+            return None
+        matches = list(projects.glob(f"*/{session_id}.jsonl"))
+        return matches[0] if matches else None
+
+
+class CodexAdapter(Adapter):
+    id = "codex"
+    name = "Codex"
+    binary = "codex"
+
+    def root(self) -> Path:
+        return expand(os.environ.get("CODEX_HOME") or "~/.codex")
+
+    def present(self) -> bool:
+        return (self.root() / "sessions").is_dir()
+
+    def index_files(self) -> list[Path]:
+        root = self.root() / "sessions"
+        if not root.is_dir():
+            return []
+        return list(root.glob("*/*/*/rollout-*.jsonl"))
+
+    def summarize_file(self, path: Path) -> list[dict[str, Any]] | None:
+        record = self._summarize(path)
+        return [record] if record else []
+
+    def _summarize(self, path: Path) -> dict[str, Any] | None:
+        session_id = ""
+        cwd = ""
+        model = ""
+        title = ""
+        count = 0
+        for obj in iter_jsonl(path, max_lines=40, max_bytes=80_000):
+            if not isinstance(obj, dict):
+                continue
+            payload = obj.get("payload") if isinstance(obj.get("payload"), dict) else {}
+            kind = obj.get("type")
+            if kind == "session_meta":
+                session_id = str(payload.get("session_id") or payload.get("id") or session_id)
+                cwd = str(payload.get("cwd") or cwd)
+            elif kind == "turn_context":
+                model = str(payload.get("model") or model)
+                cwd = str(payload.get("cwd") or cwd)
+            elif kind == "response_item":
+                role = payload.get("role")
+                text = extract_text(payload.get("content"))
+                if role == "user" and text and not looks_like_system(text) and not title:
+                    title = text
+                if role in {"user", "assistant"} and text:
+                    count += 1
+        if not session_id:
+            # rollout-2026-08-15T00-33-36-<uuid>.jsonl
+            name = path.stem
+            session_id = name.split("-", 5)[-1] if name.startswith("rollout-") else name
+        stamp, iso = mtime_iso(path)
+        if not title:
+            title = project_from_cwd(cwd) or session_id
+        return session_record(
+            source=self.id,
+            session_id=session_id,
+            title=title,
+            cwd=cwd,
+            updated_ms=stamp * 1000,
+            updated_at=iso,
+            model=model,
+            message_count=count,
+            snippet=title,
+            source_path=str(path),
+        )
+
+    def preview(self, session_id: str, *, max_turns: int = PREVIEW_TURNS, max_chars: int = 1200) -> str:
+        path = self._path_for(session_id)
+        if path is None:
+            return ""
+        turns: list[tuple[str, str]] = []
+        for obj in iter_jsonl(path, max_lines=500, max_bytes=500_000):
+            if not isinstance(obj, dict) or obj.get("type") != "response_item":
+                continue
+            payload = obj.get("payload") if isinstance(obj.get("payload"), dict) else {}
+            role = payload.get("role")
+            if role not in {"user", "assistant"}:
+                continue
+            text = extract_text(payload.get("content"))
+            if not text or looks_like_system(text):
+                continue
+            turns.append((str(role), text))
+        return format_turns(turns, max_turns=max_turns, max_chars=max_chars)
+
+    def _path_for(self, session_id: str) -> Path | None:
+        root = self.root() / "sessions"
+        if not root.is_dir():
+            return None
+        for path in root.glob("*/*/*/rollout-*.jsonl"):
+            if session_id in path.name:
+                return path
+        return None
+
+
+class GrokAdapter(Adapter):
+    id = "grok"
+    name = "Grok"
+    binary = "grok"
+
+    def root(self) -> Path:
+        return expand(os.environ.get("GROK_HOME") or "~/.grok")
+
+    def present(self) -> bool:
+        return (self.root() / "sessions").is_dir()
+
+    def index_files(self) -> list[Path]:
+        root = self.root() / "sessions"
+        if not root.is_dir():
+            return []
+        return list(root.glob("*/*/summary.json"))
+
+    def summarize_file(self, path: Path) -> list[dict[str, Any]] | None:
+        record = self._summarize(path)
+        return [record] if record else []
+
+    def _summarize(self, path: Path) -> dict[str, Any] | None:
+        data = read_json(path)
+        if not isinstance(data, dict):
+            return None
+        info = data.get("info") if isinstance(data.get("info"), dict) else {}
+        session_id = str(info.get("id") or path.parent.name)
+        cwd = str(info.get("cwd") or decode_dashed_path(path.parent.parent.name))
+        title = str(
+            data.get("generated_title")
+            or data.get("session_summary")
+            or data.get("last_turn_summary")
+            or ""
+        )
+        snippet = str(data.get("last_turn_summary") or data.get("session_summary") or title)
+        stamp = parse_iso_ms(data.get("last_active_at") or data.get("updated_at"))
+        if not stamp:
+            stamp = path.stat().st_mtime * 1000
+        return session_record(
+            source=self.id,
+            session_id=session_id,
+            title=title or project_from_cwd(cwd) or session_id,
+            cwd=cwd,
+            updated_ms=int(stamp),
+            model=str(data.get("current_model_id") or ""),
+            message_count=int(data.get("num_chat_messages") or data.get("num_messages") or 0),
+            snippet=snippet,
+            source_path=str(path.parent),
+        )
+
+    def preview(self, session_id: str, *, max_turns: int = PREVIEW_TURNS, max_chars: int = 1200) -> str:
+        directory = self._dir_for(session_id)
+        if directory is None:
+            return ""
+        history = directory / "chat_history.jsonl"
+        turns: list[tuple[str, str]] = []
+        for obj in iter_jsonl(history, max_lines=400, max_bytes=400_000):
+            if not isinstance(obj, dict):
+                continue
+            kind = str(obj.get("type") or obj.get("role") or "")
+            text = extract_text(obj.get("content") or obj.get("message") or obj)
+            if not text or looks_like_system(text):
+                continue
+            if kind in {"user", "human"}:
+                turns.append(("user", text))
+            elif kind in {"assistant", "model", "agent"}:
+                turns.append(("assistant", text))
+            elif kind in {"text", "message"} and not text.startswith("You are "):
+                # Grok often stores turns as {type, content} without a role.
+                role = "user" if len(turns) % 2 == 0 else "assistant"
+                # Prefer explicit later; skip system-like blobs already handled.
+                if "<user_info>" in text or "<system-reminder>" in text:
+                    continue
+                turns.append((role, text))
+        if turns:
+            return format_turns(turns, max_turns=max_turns, max_chars=max_chars)
+        summary = read_json(directory / "summary.json")
+        if isinstance(summary, dict):
+            bits = [
+                summary.get("generated_title"),
+                summary.get("session_summary"),
+                summary.get("last_turn_summary"),
+            ]
+            return "\n\n".join(str(bit) for bit in bits if bit)
+        return ""
+
+    def _dir_for(self, session_id: str) -> Path | None:
+        root = self.root() / "sessions"
+        if not root.is_dir():
+            return None
+        matches = list(root.glob(f"*/{session_id}"))
+        return matches[0] if matches else None
+
+
+class PiAdapter(Adapter):
+    id = "pi"
+    name = "Pi"
+    binary = "pi"
+
+    def root(self) -> Path:
+        return expand(os.environ.get("PI_CODING_AGENT_DIR") or "~/.pi/agent")
+
+    def present(self) -> bool:
+        return (self.root() / "sessions").is_dir()
+
+    def index_files(self) -> list[Path]:
+        root = self.root() / "sessions"
+        if not root.is_dir():
+            return []
+        return list(root.glob("*/*.jsonl"))
+
+    def summarize_file(self, path: Path) -> list[dict[str, Any]] | None:
+        record = self._summarize(path)
+        return [record] if record else []
+
+    def _summarize(self, path: Path) -> dict[str, Any] | None:
+        session_id = ""
+        cwd = decode_dashed_path(path.parent.name)
+        title = ""
+        model = ""
+        count = 0
+        for obj in iter_jsonl(path, max_lines=60, max_bytes=80_000):
+            if not isinstance(obj, dict):
+                continue
+            kind = obj.get("type")
+            if kind == "session":
+                session_id = str(obj.get("id") or session_id)
+                cwd = str(obj.get("cwd") or cwd)
+            elif kind == "model_change":
+                model = str(obj.get("modelId") or obj.get("model") or model)
+            elif kind == "message":
+                text = extract_text(obj.get("message") or obj)
+                role = ""
+                message = obj.get("message")
+                if isinstance(message, dict):
+                    role = str(message.get("role") or "")
+                    text = extract_text(message) or text
+                if text and not looks_like_system(text):
+                    count += 1
+                    if not title and role in {"", "user"}:
+                        title = text
+        if not session_id:
+            # 2026-08-11T09-42-40-025Z_<uuid>.jsonl
+            stem = path.stem
+            session_id = stem.split("_")[-1] if "_" in stem else stem
+        stamp, iso = mtime_iso(path)
+        return session_record(
+            source=self.id,
+            session_id=session_id,
+            title=title or project_from_cwd(cwd) or session_id,
+            cwd=cwd,
+            updated_ms=stamp * 1000,
+            updated_at=iso,
+            model=model,
+            message_count=count,
+            snippet=title,
+            source_path=str(path),
+        )
+
+    def preview(self, session_id: str, *, max_turns: int = PREVIEW_TURNS, max_chars: int = 1200) -> str:
+        path = self._path_for(session_id)
+        if path is None:
+            return ""
+        turns: list[tuple[str, str]] = []
+        for obj in iter_jsonl(path, max_lines=400, max_bytes=400_000):
+            if not isinstance(obj, dict) or obj.get("type") != "message":
+                continue
+            message = obj.get("message")
+            role = "user"
+            text = extract_text(message or obj)
+            if isinstance(message, dict):
+                role = str(message.get("role") or "user")
+                text = extract_text(message) or text
+            if not text or looks_like_system(text):
+                continue
+            if role not in {"user", "assistant"}:
+                role = "assistant" if role in {"model", "agent"} else "user"
+            turns.append((role, text))
+        return format_turns(turns, max_turns=max_turns, max_chars=max_chars)
+
+    def _path_for(self, session_id: str) -> Path | None:
+        root = self.root() / "sessions"
+        if not root.is_dir():
+            return None
+        for path in root.glob("*/*.jsonl"):
+            if session_id in path.name:
+                return path
+        return None
+
+    def resume_plan(self, session_id: str) -> dict[str, Any] | None:
+        path = self._path_for(session_id)
+        cwd = str(HOME)
+        target = session_id
+        if path is not None:
+            target = str(path)
+            for obj in iter_jsonl(path, max_lines=5):
+                if isinstance(obj, dict) and obj.get("type") == "session":
+                    cwd = str(obj.get("cwd") or cwd)
+                    break
+        return {"command": ["pi", "--session", target], "cwd": cwd, "id": session_id}
+
+
+class OpenCodeAdapter(Adapter):
+    id = "opencode"
+    name = "OpenCode"
+    binary = "opencode"
+
+    def db_path(self) -> Path:
+        xdg = Path(os.environ.get("XDG_DATA_HOME", HOME / ".local/share"))
+        return xdg / "opencode" / "opencode.db"
+
+    def present(self) -> bool:
+        return self.db_path().is_file()
+
+    def _connect(self) -> sqlite3.Connection | None:
+        path = self.db_path()
+        if not path.is_file():
+            return None
+        try:
+            return sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        except sqlite3.Error:
+            return None
+
+    def index_files(self) -> list[Path]:
+        path = self.db_path()
+        return [path] if path.is_file() else []
+
+    def summarize_file(self, path: Path) -> list[dict[str, Any]] | None:
+        return self._query_sessions(10000)
+
+    def _query_sessions(self, limit: int) -> list[dict[str, Any]]:
+        conn = self._connect()
+        if conn is None:
+            return []
+        try:
+            rows = conn.execute(
+                """
+                SELECT id, title, directory, model, agent, time_updated, time_created
+                FROM session
+                WHERE time_archived IS NULL OR time_archived = 0
+                ORDER BY time_updated DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        except sqlite3.Error:
+            return []
+        finally:
+            conn.close()
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            session_id, title, directory, model, agent, updated, created = row
+            stamp = int(updated or created or 0)
+            # OpenCode stores ms-or-seconds depending on version.
+            if stamp < 10_000_000_000:
+                stamp *= 1000
+            out.append(
+                session_record(
+                    source=self.id,
+                    session_id=str(session_id),
+                    title=str(title or directory or session_id),
+                    cwd=str(directory or ""),
+                    updated_ms=stamp,
+                    model=str(model or agent or ""),
+                    snippet=str(title or ""),
+                    source_path=str(self.db_path()),
+                )
+            )
+        return out
+
+    def preview(self, session_id: str, *, max_turns: int = PREVIEW_TURNS, max_chars: int = 1200) -> str:
+        conn = self._connect()
+        if conn is None:
+            return ""
+        try:
+            rows = conn.execute(
+                """
+                SELECT type, data FROM session_message
+                WHERE session_id = ?
+                ORDER BY seq ASC
+                LIMIT 80
+                """,
+                (session_id,),
+            ).fetchall()
+            if not rows:
+                rows = conn.execute(
+                    """
+                    SELECT 'message', data FROM message
+                    WHERE session_id = ?
+                    ORDER BY time_created ASC
+                    LIMIT 80
+                    """,
+                    (session_id,),
+                ).fetchall()
+        except sqlite3.Error:
+            return ""
+        finally:
+            conn.close()
+        turns: list[tuple[str, str]] = []
+        for kind, raw in rows:
+            data = raw
+            if isinstance(raw, str):
+                try:
+                    data = json.loads(raw)
+                except json.JSONDecodeError:
+                    data = {"text": raw}
+            text = extract_text(data)
+            if not text or looks_like_system(text):
+                continue
+            role = "user"
+            if isinstance(data, dict):
+                role = str(data.get("role") or data.get("type") or kind or "user")
+            if role not in {"user", "assistant"}:
+                role = "assistant" if "assistant" in role or "agent" in role else "user"
+            turns.append((role, text))
+        return format_turns(turns, max_turns=max_turns, max_chars=max_chars)
+
+
+class ExternalAdapter(Adapter):
+    """An executable that speaks the omarchy-agent-sessions contract."""
+
+    def __init__(self, agent_id: str, command: Path, name: str = ""):
+        self.id = agent_id
+        self.binary = agent_id
+        self.name = name or REGISTERED_AGENTS.get(agent_id, {}).get("name") or agent_id
+        self.command = command
+
+    def present(self) -> bool:
+        return self.command.is_file() and os.access(self.command, os.X_OK)
+
+    def _run(self, args: list[str], timeout: int = 8) -> tuple[int, str, str]:
+        try:
+            proc = subprocess.run(
+                [str(self.command), *args],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+            return proc.returncode, proc.stdout, proc.stderr
+        except (OSError, subprocess.TimeoutExpired) as error:
+            return 1, "", str(error)
+
+    def list_sessions(self, limit: int) -> list[dict[str, Any]]:
+        code, stdout, _ = self._run(["list", "--limit", str(limit)])
+        if code != 0 or not stdout.strip():
+            return []
+        sessions: list[dict[str, Any]] = []
+        payload = stdout.strip()
+        parsed: Any
+        try:
+            parsed = json.loads(payload)
+        except json.JSONDecodeError:
+            parsed = None
+        rows: list[Any]
+        if isinstance(parsed, dict) and isinstance(parsed.get("sessions"), list):
+            rows = parsed["sessions"]
+        elif isinstance(parsed, list):
+            rows = parsed
+        else:
+            rows = []
+            for line in payload.splitlines():
+                try:
+                    rows.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            sessions.append(
+                session_record(
+                    source=self.id,
+                    session_id=str(row.get("id") or row.get("session_id") or ""),
+                    title=str(row.get("title") or ""),
+                    cwd=str(row.get("cwd") or ""),
+                    updated_ms=parse_iso_ms(row.get("updatedAtMs") or row.get("updatedAt") or row.get("updated_at")),
+                    updated_at=str(row.get("updatedAt") or row.get("updated_at") or ""),
+                    model=str(row.get("model") or ""),
+                    message_count=int(row.get("messageCount") or row.get("message_count") or 0),
+                    snippet=str(row.get("snippet") or row.get("title") or ""),
+                    source_path=str(row.get("sourcePath") or row.get("source_path") or ""),
+                )
+            )
+        return [item for item in sessions if item["id"]]
+
+    def preview(self, session_id: str, *, max_turns: int = PREVIEW_TURNS, max_chars: int = 1200) -> str:
+        code, stdout, _ = self._run(["preview", session_id])
+        return stdout if code == 0 else ""
+
+    def resume_plan(self, session_id: str) -> dict[str, Any] | None:
+        code, stdout, _ = self._run(["resume", session_id])
+        if code != 0:
+            return None
+        try:
+            data = json.loads(stdout)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(data, dict) or not data.get("command"):
+            return None
+        command = data["command"]
+        if isinstance(command, str):
+            command = [command]
+        return {
+            "command": [str(part) for part in command],
+            "cwd": str(data.get("cwd") or HOME),
+            "id": session_id,
+        }
+
+
+BUILTINS: dict[str, Callable[[], Adapter]] = {
+    "claude": ClaudeAdapter,
+    "codex": CodexAdapter,
+    "grok": GrokAdapter,
+    "pi": PiAdapter,
+    "opencode": OpenCodeAdapter,
+}
+
+
+# ---------------------------------------------------------------------------
+# discovery
+# ---------------------------------------------------------------------------
+
+def limit_from_env() -> int:
+    raw = os.environ.get("OMARCHY_RECALL_LIMIT", "")
+    try:
+        value = int(raw)
+        return max(20, min(value, 1000))
+    except ValueError:
+        return DEFAULT_LIMIT
+
+
+def discover_external_adapters() -> dict[str, ExternalAdapter]:
+    found: dict[str, ExternalAdapter] = {}
+
+    def consider(path: Path, agent_id: str) -> None:
+        if not path.is_file() or not os.access(path, os.X_OK):
+            return
+        # Refuse world-writable adapters; they run inside the user's session.
+        mode = path.stat().st_mode
+        if mode & stat.S_IWOTH:
+            return
+        found[agent_id] = ExternalAdapter(agent_id, path)
+
+    if USER_ADAPTER_DIR.is_dir():
+        for path in USER_ADAPTER_DIR.iterdir():
+            if path.name.startswith("."):
+                continue
+            consider(path, path.name)
+
+    prefix = "omarchy-agent-sessions-"
+    search_dirs: list[Path] = []
+    omarchy_path = os.environ.get("OMARCHY_PATH")
+    if omarchy_path:
+        search_dirs.append(Path(omarchy_path) / "bin")
+    for part in os.environ.get("PATH", "").split(os.pathsep):
+        if part:
+            search_dirs.append(Path(part))
+    for directory in search_dirs:
+        try:
+            entries = list(directory.iterdir())
+        except OSError:
+            continue
+        for path in entries:
+            name = path.name
+            if not name.startswith(prefix):
+                continue
+            consider(path, name[len(prefix) :])
+
+    return found
+
+
+def enabled_source_ids(config: dict[str, Any]) -> set[str] | None:
+    sources = config.get("sources")
+    if not isinstance(sources, dict) or not sources:
+        return None
+    enabled = {key for key, value in sources.items() if value is not False and not (
+        isinstance(value, dict) and value.get("enabled") is False
+    )}
+    return enabled
+
+
+def collect_sources() -> list[dict[str, Any]]:
+    config = load_config()
+    usage = usage_records()
+    external = discover_external_adapters()
+    allowed = enabled_source_ids(config)
+    default = default_agent()
+
+    ids: list[str] = []
+    for agent_id in REGISTERED_AGENTS:
+        if agent_id not in ids:
+            ids.append(agent_id)
+    for agent_id in usage:
+        if agent_id not in ids:
+            ids.append(agent_id)
+    for agent_id in external:
+        if agent_id not in ids:
+            ids.append(agent_id)
+
+    sources: list[dict[str, Any]] = []
+    for agent_id in ids:
+        if allowed is not None and agent_id not in allowed:
+            continue
+        meta = REGISTERED_AGENTS.get(agent_id, {})
+        usage_row = usage.get(agent_id) or {}
+        adapter: Adapter | None
+        if agent_id in external:
+            adapter = external[agent_id]
+        elif agent_id in BUILTINS:
+            adapter = BUILTINS[agent_id]()
+        else:
+            adapter = None
+        name = str(
+            usage_row.get("name")
+            or (adapter.name if adapter else "")
+            or meta.get("name")
+            or agent_id
+        )
+        binary = str(meta.get("binary") or agent_id)
+        present = bool(adapter.present()) if adapter else False
+        installed = command_on_path(binary) or present
+        registered = agent_id in usage or agent_id == default
+        startable = start_command(agent_id, "x") is not None and command_on_path(binary)
+        if not adapter:
+            if not startable:
+                continue
+            sources.append(
+                {
+                    "id": agent_id,
+                    "name": name,
+                    "registered": bool(registered or agent_id in REGISTERED_AGENTS),
+                    "installed": True,
+                    "hasAdapter": False,
+                    "canStart": True,
+                    "isDefault": agent_id == default,
+                    "mark": mark_url(agent_id),
+                }
+            )
+            continue
+        if not present and not registered and agent_id not in external and not startable:
+            continue
+        sources.append(
+            {
+                "id": agent_id,
+                "name": name,
+                "registered": bool(registered or agent_id in REGISTERED_AGENTS),
+                "installed": installed,
+                "hasAdapter": True,
+                "canStart": startable,
+                "isDefault": agent_id == default,
+                "mark": mark_url(agent_id),
+                "adapter": adapter,
+            }
+        )
+    return sources
+
+
+def mark_url(agent_id: str) -> str:
+    path = PLUGIN_DIR / "assets" / f"{agent_id}.svg"
+    if path.is_file():
+        return path.as_uri()
+    return ""
+
+
+def format_turns(
+    turns: list[tuple[str, str]],
+    *,
+    max_turns: int = PREVIEW_TURNS,
+    max_chars: int = 1200,
+    user_label: str = "You",
+    agent_label: str = "Agent",
+) -> str:
+    if not turns:
+        return ""
+    chosen = turns[-max_turns:]
+    blocks: list[str] = []
+    for role, text in chosen:
+        label = user_label if role == "user" else agent_label
+        body = clip(tidy_preview(text), max_chars)
+        if not body:
+            continue
+        blocks.append(f"{label}\n{body}")
+    return "\n\n".join(blocks)
+
+
+def start_command(agent_id: str, prompt: str) -> list[str] | None:
+    """Launch a *new* session in another agent, matching omarchy-agent flags."""
+    if agent_id == "opencode":
+        return ["opencode", "--auto", "--prompt", prompt]
+    if agent_id == "gemini":
+        return ["gemini", "--yolo", "--prompt-interactive", prompt]
+    if agent_id == "copilot":
+        return ["copilot", "--allow-all", "--interactive", prompt]
+    if agent_id == "crush":
+        return ["crush", "run", prompt]
+    if agent_id in {"claude", "grok"}:
+        return [agent_id, "--permission-mode", "bypassPermissions", "--", prompt]
+    if agent_id == "codex":
+        return ["codex", "--dangerously-bypass-approvals-and-sandbox", "--", prompt]
+    if agent_id == "omp":
+        return ["omp", "--auto-approve", "--", prompt]
+    if agent_id == "pi":
+        return ["pi", prompt]
+    if agent_id == "cursor":
+        return ["cursor-agent", prompt]
+    return None
+
+
+def can_start_agent(agent_id: str, binary: str) -> bool:
+    return start_command(agent_id, "x") is not None and command_on_path(binary)
+
+
+def handoff_path(source: str, session_id: str) -> Path:
+    cache = Path(os.environ.get("XDG_CACHE_HOME", HOME / ".cache")) / "omarchy" / "recall"
+    cache.mkdir(parents=True, exist_ok=True)
+    safe = "".join(ch if ch.isalnum() or ch in "-_" else "-" for ch in session_id)[:48]
+    return cache / f"{source}-{safe}.md"
+
+
+def compose_handoff(session: dict[str, Any], transcript: str) -> str:
+    title = session.get("title") or session.get("id") or "untitled"
+    cwd = session.get("cwd") or ""
+    source = session.get("source") or "unknown"
+    return (
+        f"Continue this coding session.\n"
+        f"Original agent: {source}\n"
+        f"Title: {title}\n"
+        f"Directory: {cwd}\n\n"
+        f"The transcript below is the prior conversation. Pick up the work. "
+        f"Do not restate these instructions.\n\n"
+        f"## Transcript\n\n"
+        f"{transcript.strip()}\n"
+    )
+
+
+def compose_file_prompt(path: Path, session: dict[str, Any]) -> str:
+    cwd = session.get("cwd") or ""
+    source = session.get("source") or "unknown"
+    return (
+        f"Read the previous {source} session transcript at {path} and continue "
+        f"that work{f' in {cwd}' if cwd else ''}. Follow the last user request. "
+        f"Do not summarize the file unless asked."
+    )
+
+
+def copy_to_clipboard(text: str) -> bool:
+    copy = which("wl-copy")
+    if not copy:
+        return False
+    try:
+        subprocess.run([copy, "--type", "text/plain"], input=text, text=True, check=True)
+        return True
+    except (OSError, subprocess.CalledProcessError):
+        return False
+
+
+def lookup_session(adapter: Adapter, session_id: str) -> dict[str, Any]:
+    for item in adapter.list_sessions(max(limit_from_env(), 400)):
+        if item["id"] == session_id:
+            return item
+    return {"id": session_id, "source": adapter.id, "cwd": str(HOME), "title": session_id}
+
+
+# ---------------------------------------------------------------------------
+# commands
+# ---------------------------------------------------------------------------
+
+def filter_sessions(sessions: list[dict[str, Any]], query: str, cwd: str) -> list[dict[str, Any]]:
+    if cwd:
+        cwd_path = str(expand(cwd))
+        sessions = [item for item in sessions if str(item.get("cwd") or "").startswith(cwd_path)]
+    if not query:
+        return sessions
+    needles = query.casefold().split()
+    scored: list[tuple[int, dict[str, Any]]] = []
+    for item in sessions:
+        hay = " ".join(
+            str(item.get(key) or "")
+            for key in ("title", "snippet", "project", "projectLabel", "projectKey", "cwd", "source", "model", "id")
+        ).casefold()
+        if all(needle in hay for needle in needles):
+            score = sum(hay.find(needle) for needle in needles)
+            scored.append((score, item))
+    scored.sort(key=lambda pair: (pair[0], -int(pair[1].get("updatedAtMs") or 0)))
+    return [item for _, item in scored]
+
+
+def list_command(args: argparse.Namespace) -> int:
+    limit = args.limit or limit_from_env()
+    sources = collect_sources()
+    wanted = args.source or ""
+    sessions: list[dict[str, Any]] = []
+    source_payload: list[dict[str, Any]] = []
+    for source in sources:
+        row = {key: source[key] for key in source if key != "adapter"}
+        adapter: Adapter | None = source.get("adapter")
+        if adapter is None:
+            row["sessionCount"] = 0
+            source_payload.append(row)
+            continue
+        if wanted and source["id"] != wanted:
+            row["sessionCount"] = 0
+            source_payload.append(row)
+            continue
+        found = adapter.list_sessions(limit)
+        row["sessionCount"] = len(found)
+        source_payload.append(row)
+        sessions.extend(found)
+    session_index().save()
+    sessions.sort(key=lambda item: int(item.get("updatedAtMs") or 0), reverse=True)
+    sessions = filter_sessions(sessions, args.query or "", args.cwd or "")
+    sessions = sessions[:limit]
+    counts: dict[str, int] = {}
+    for item in sessions:
+        counts[item["source"]] = counts.get(item["source"], 0) + 1
+    for row in source_payload:
+        if row["id"] in counts:
+            row["matchCount"] = counts[row["id"]]
+        else:
+            row["matchCount"] = 0
+    payload = {
+        "schemaVersion": 1,
+        "defaultAgent": default_agent(),
+        "query": args.query or "",
+        "cwd": args.cwd or "",
+        "sources": source_payload,
+        "sessions": sessions,
+    }
+    json.dump(payload, sys.stdout, ensure_ascii=False)
+    sys.stdout.write("\n")
+    return 0
+
+
+def find_adapter(source_id: str) -> Adapter | None:
+    for source in collect_sources():
+        if source["id"] == source_id:
+            adapter = source.get("adapter")
+            return adapter if isinstance(adapter, Adapter) else None
+    return None
+
+
+def preview_command(args: argparse.Namespace) -> int:
+    adapter = find_adapter(args.source)
+    if adapter is None:
+        print(f"unknown source: {args.source}", file=sys.stderr)
+        return 1
+    text = adapter.preview(args.id)
+    sys.stdout.write(text)
+    if text and not text.endswith("\n"):
+        sys.stdout.write("\n")
+    return 0
+
+
+def resolved_workdir(cwd: str) -> str:
+    if cwd:
+        path = Path(cwd)
+        if path.is_dir():
+            return str(path)
+    return str(HOME)
+
+
+def build_launch_argv(command: list[str], workdir: str) -> list[str]:
+    """Open the agent in a terminal whose working directory is the session cwd.
+
+    `omarchy-launch-tui` cannot pass a directory. `xdg-terminal-exec --dir`
+    does, and that is what ends up as foot's `--working-directory`. uwsm-app
+    is kept so the window is still a graphical session unit, matching the
+    rest of Omarchy.
+    """
+    terminal = which("xdg-terminal-exec")
+    if terminal:
+        argv = [terminal, "--app-id=org.omarchy.agent", f"--dir={workdir}", "--", *command]
+        uwsm = which("uwsm-app")
+        if uwsm:
+            argv = [uwsm, "--", *argv]
+        setsid = which("setsid")
+        if setsid:
+            argv = [setsid, *argv]
+        return argv
+    launcher = which("omarchy-launch-tui")
+    if launcher:
+        return [launcher, "--app-id=org.omarchy.agent", *command]
+    raise FileNotFoundError("no terminal launcher found")
+
+
+def launch_terminal(command: list[str], cwd: str) -> int:
+    workdir = resolved_workdir(cwd)
+    try:
+        argv = build_launch_argv(command, workdir)
+    except FileNotFoundError as error:
+        print(str(error), file=sys.stderr)
+        return 1
+    try:
+        os.chdir(workdir)
+    except OSError:
+        os.chdir(str(HOME))
+    os.execvp(argv[0], argv)
+    return 1
+
+
+def export_command(args: argparse.Namespace) -> int:
+    adapter = find_adapter(args.source)
+    if adapter is None:
+        print(f"unknown source: {args.source}", file=sys.stderr)
+        return 1
+    session = lookup_session(adapter, args.id)
+    transcript = adapter.export(args.id)
+    if args.format == "handoff":
+        text = compose_handoff(session, transcript)
+    else:
+        text = transcript
+    sys.stdout.write(text)
+    if text and not text.endswith("\n"):
+        sys.stdout.write("\n")
+    return 0 if text else 1
+
+
+def copy_command(args: argparse.Namespace) -> int:
+    adapter = find_adapter(args.source)
+    if adapter is None:
+        print(f"unknown source: {args.source}", file=sys.stderr)
+        return 1
+    session = lookup_session(adapter, args.id)
+    transcript = adapter.export(args.id)
+    if not transcript.strip():
+        print(json.dumps({"ok": False, "error": "empty transcript"}))
+        return 1
+    text = compose_handoff(session, transcript)
+    if not copy_to_clipboard(text):
+        print(json.dumps({"ok": False, "error": "wl-copy is not available"}))
+        return 1
+    turns = max(1, text.count("\n\n"))
+    json.dump({"ok": True, "turns": turns, "bytes": len(text)}, sys.stdout)
+    sys.stdout.write("\n")
+    return 0
+
+
+def open_command(args: argparse.Namespace) -> int:
+    adapter = find_adapter(args.source)
+    if adapter is None:
+        print(f"unknown source: {args.source}", file=sys.stderr)
+        return 1
+    target = args.agent
+    command = start_command(target, "x")
+    if command is None:
+        print(f"cannot start agent: {target}", file=sys.stderr)
+        return 1
+    session = lookup_session(adapter, args.id)
+    transcript = adapter.export(args.id)
+    if not transcript.strip():
+        print("no transcript to hand off", file=sys.stderr)
+        return 1
+    handoff = compose_handoff(session, transcript)
+    if len(handoff) > HANDOFF_INLINE_CHARS:
+        path = handoff_path(args.source, args.id)
+        path.write_text(handoff, encoding="utf-8")
+        prompt = compose_file_prompt(path, session)
+    else:
+        prompt = handoff
+    argv = start_command(target, prompt)
+    if not argv:
+        return 1
+    if args.print:
+        json.dump({"command": argv, "cwd": session.get("cwd") or str(HOME), "agent": target}, sys.stdout)
+        sys.stdout.write("\n")
+        return 0
+    return launch_terminal(argv, str(session.get("cwd") or HOME))
+
+
+def resume_command(args: argparse.Namespace) -> int:
+    adapter = find_adapter(args.source)
+    if adapter is None:
+        print(f"unknown source: {args.source}", file=sys.stderr)
+        return 1
+    plan = adapter.resume_plan(args.id)
+    if not plan or not plan.get("command"):
+        print(f"cannot resume {args.source} session {args.id}", file=sys.stderr)
+        return 1
+    if args.print:
+        json.dump(plan, sys.stdout, ensure_ascii=False)
+        sys.stdout.write("\n")
+        return 0
+    return launch_terminal([str(part) for part in plan["command"]], str(plan.get("cwd") or HOME))
+
+
+def sources_command(_args: argparse.Namespace) -> int:
+    sources = []
+    for source in collect_sources():
+        sources.append({key: source[key] for key in source if key != "adapter"})
+    json.dump({"schemaVersion": 1, "defaultAgent": default_agent(), "sources": sources}, sys.stdout, ensure_ascii=False)
+    sys.stdout.write("\n")
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="recall", description="List and resume AI coding sessions")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    listing = sub.add_parser("list", help="print sessions as JSON")
+    listing.add_argument("--query", default="")
+    listing.add_argument("--source", default="")
+    listing.add_argument("--cwd", default="")
+    listing.add_argument("--limit", type=int, default=0)
+    listing.set_defaults(func=list_command)
+
+    preview = sub.add_parser("preview", help="print a session transcript")
+    preview.add_argument("source")
+    preview.add_argument("id")
+    preview.set_defaults(func=preview_command)
+
+    export = sub.add_parser("export", help="print a pasteable transcript")
+    export.add_argument("source")
+    export.add_argument("id")
+    export.add_argument("--format", choices=("plain", "handoff"), default="handoff")
+    export.set_defaults(func=export_command)
+
+    copy = sub.add_parser("copy", help="copy a pasteable transcript to the clipboard")
+    copy.add_argument("source")
+    copy.add_argument("id")
+    copy.set_defaults(func=copy_command)
+
+    opener = sub.add_parser("open", help="start the transcript in another agent")
+    opener.add_argument("source")
+    opener.add_argument("id")
+    opener.add_argument("--agent", required=True, help="target agent id, e.g. claude or grok")
+    opener.add_argument("--print", action="store_true")
+    opener.set_defaults(func=open_command)
+
+    resume = sub.add_parser("resume", help="open a session in a terminal")
+    resume.add_argument("source")
+    resume.add_argument("id")
+    resume.add_argument("--print", action="store_true", help="print the launch plan instead of exec")
+    resume.set_defaults(func=resume_command)
+
+    sources = sub.add_parser("sources", help="print discovered session sources")
+    sources.set_defaults(func=sources_command)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    return int(args.func(args))
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except KeyboardInterrupt:
+        raise SystemExit(130)
