@@ -39,9 +39,8 @@ Omarchy already has a registration path for coding agents:
 - `omarchy agent` launches the chosen CLI with the right “don't stop to ask”
   flags and the shared `org.omarchy.agent` window class
 
-Recall reads those same records. A source chip uses the usage record's
-display name when one exists, bolds the default agent, and resumes with the
-same launch flags so a recalled session behaves like one started from the
+Recall reads those same records for display names and resumes with the same
+launch flags so a recalled session behaves like one started from the
 keybinding.
 
 Adding an agent to the picker is the same move as adding one to the usage
@@ -150,22 +149,24 @@ omarchy-shell shell summon thomas.recall '{"source":"grok","cwd":"/home/you/code
 
 ## Install
 
-This folder is a normal Omarchy plugin. From a git checkout:
-
 ```
-omarchy plugin add <git-url> --enable
+omarchy plugin add https://github.com/anagrius/omarchy-recall.git --enable
 ```
 
-Or copy it to `~/.config/omarchy/plugins/thomas.recall/` and run:
-
-```
-omarchy plugin validate ~/.config/omarchy/plugins/thomas.recall
-omarchy-shell shell rescanPlugins
-omarchy plugin enable thomas.recall
-```
-
-Then bind it and add the menu row if they are not already present:
+Summon it with:
 
 ```
 omarchy-shell shell toggle thomas.recall
+```
+
+Optional Super+Alt+A binding in `~/.config/hypr/bindings.lua`:
+
+```
+o.bind("SUPER + ALT + A", "Recall session", "omarchy-shell shell toggle thomas.recall")
+```
+
+## Remove
+
+```
+omarchy plugin remove thomas.recall
 ```
