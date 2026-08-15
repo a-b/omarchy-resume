@@ -23,7 +23,7 @@ the same way.
 Summon it:
 
 ```
-omarchy-shell shell toggle thomas.resume
+omarchy-shell shell toggle anagrius.resume
 ```
 
 Or press Super+Alt+A after the binding below is in place. The Omarchy menu
@@ -145,7 +145,7 @@ The overlay accepts a JSON payload, so other plugins can open it already
 narrowed:
 
 ```
-omarchy-shell shell summon thomas.resume '{"source":"grok","cwd":"/home/you/code/app"}'
+omarchy-shell shell summon anagrius.resume '{"source":"grok","cwd":"/home/you/code/app"}'
 ```
 
 ## Install
@@ -157,17 +157,17 @@ omarchy plugin add https://github.com/anagrius/omarchy-resume.git --enable
 Summon it with:
 
 ```
-omarchy-shell shell toggle thomas.resume
+omarchy-shell shell toggle anagrius.resume
 ```
 
 Optional Super+Alt+A binding in `~/.config/hypr/bindings.lua`:
 
 ```
-o.bind("SUPER + ALT + A", "Resume AI Session", "omarchy-shell shell toggle thomas.resume")
+o.bind("SUPER + ALT + A", "Resume AI Session", "omarchy-shell shell toggle anagrius.resume")
 ```
 
 ## Remove
 
 ```
-omarchy plugin remove thomas.resume
+omarchy plugin remove anagrius.resume
 ```

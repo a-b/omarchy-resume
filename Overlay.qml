@@ -13,7 +13,7 @@ Item {
   property var manifest: null
   property string omarchyPath: Quickshell.env("OMARCHY_PATH")
 
-  readonly property string pluginDir: manifest && manifest.__sourceDir ? String(manifest.__sourceDir) : (Quickshell.env("HOME") + "/.config/omarchy/plugins/thomas.resume")
+  readonly property string pluginDir: manifest && manifest.__sourceDir ? String(manifest.__sourceDir) : (Quickshell.env("HOME") + "/.config/omarchy/plugins/anagrius.resume")
   readonly property string resumeBin: pluginDir + "/bin/resume"
 
   property bool opened: false
@@ -80,7 +80,7 @@ Item {
   function dismiss() {
     root.close()
     if (root.shell && typeof root.shell.hide === "function")
-      root.shell.hide((root.manifest && root.manifest.id) || "thomas.resume")
+      root.shell.hide((root.manifest && root.manifest.id) || "anagrius.resume")
   }
 
   function toggle() {
@@ -492,7 +492,7 @@ Item {
     visible: root.opened
     anchors { top: true; bottom: true; left: true; right: true }
     color: "transparent"
-    WlrLayershell.namespace: "thomas-resume"
+    WlrLayershell.namespace: "anagrius-resume"
     WlrLayershell.layer: WlrLayer.Overlay
     WlrLayershell.keyboardFocus: WlrKeyboardFocus.Exclusive
     exclusionMode: ExclusionMode.Ignore
