@@ -29,6 +29,13 @@ Item {
   property bool previewLoading: false
   property bool handoffOpen: false
   property int handoffIndex: 0
+  property bool herdrAvailable: false
+  property bool herdrRunning: false
+  property bool herdrStatusReady: false
+  property bool herdrPromptOpen: false
+  property int herdrPromptIndex: 1
+  property string pendingAction: ""
+  property string pendingAgent: ""
   property string statusText: ""
   property double nowMs: Date.now()
 
@@ -64,17 +71,27 @@ Item {
     root.errorText = ""
     root.handoffOpen = false
     root.handoffIndex = 0
+    root.herdrStatusReady = false
+    root.herdrPromptOpen = false
+    root.herdrPromptIndex = 1
+    root.pendingAction = ""
+    root.pendingAgent = ""
     root.statusText = ""
     root.nowMs = Date.now()
     root.disarmPointer()
     root.refresh()
+    root.refreshHerdrStatus()
     Qt.callLater(function() { keyCatcher.forceActiveFocus() })
   }
 
   function close() {
     root.opened = false
+    root.herdrPromptOpen = false
+    root.pendingAction = ""
+    root.pendingAgent = ""
     listProc.running = false
     previewProc.running = false
+    herdrStatusProc.running = false
   }
 
   function dismiss() {
@@ -309,14 +326,82 @@ Item {
 
   function activateIndex(index) {
     if (index < 0 || index >= displayModel.count) return
-    var row = displayModel.get(index)
-    root.resumeSession(row.source, row.sessionId)
+    root.selectedIndex = index
+    root.requestLaunch("resume", "")
   }
 
-  function resumeSession(source, sessionId) {
-    if (!source || !sessionId) return
+  function refreshHerdrStatus() {
+    herdrStatusProc.running = false
+    herdrStatusProc.running = true
+  }
+
+  function applyHerdrStatus(raw) {
+    var data = Resume.parseHerdrStatus(raw)
+    root.herdrAvailable = data.available
+    root.herdrRunning = data.running
+    root.herdrStatusReady = true
+    if (root.opened && root.pendingAction && !root.herdrPromptOpen) {
+      var action = root.pendingAction
+      var agentId = root.pendingAgent
+      root.pendingAction = ""
+      root.pendingAgent = ""
+      root.requestLaunch(action, agentId)
+    }
+  }
+
+  function requestLaunch(action, agentId) {
+    if (displayModel.count === 0) return
+    if (!root.herdrStatusReady) {
+      root.pendingAction = action
+      root.pendingAgent = agentId || ""
+      root.refreshHerdrStatus()
+      return
+    }
+    if (root.herdrRunning) {
+      root.commitLaunch(action, agentId, "herdr")
+      return
+    }
+    if (root.herdrAvailable) {
+      root.pendingAction = action
+      root.pendingAgent = agentId || ""
+      root.herdrPromptIndex = 1
+      root.herdrPromptOpen = true
+      root.handoffOpen = false
+      root.disarmPointer()
+      return
+    }
+    root.commitLaunch(action, agentId, "terminal")
+  }
+
+  function cancelHerdrPrompt() {
+    root.herdrPromptOpen = false
+    root.pendingAction = ""
+    root.pendingAgent = ""
+    root.disarmPointer()
+    Qt.callLater(function() { keyCatcher.forceActiveFocus() })
+  }
+
+  function confirmHerdrPrompt() {
+    var target = root.herdrPromptIndex === 1 ? "herdr" : "terminal"
+    var action = root.pendingAction || "resume"
+    var agentId = root.pendingAgent
+    root.herdrPromptOpen = false
+    root.commitLaunch(action, agentId, target)
+  }
+
+  function commitLaunch(action, agentId, target) {
+    var row = root.currentRow()
+    if (!row) return
+    var args = [root.resumeBin]
+    if (action === "open") {
+      if (!agentId) return
+      args.push("open", row.source, row.sessionId, "--agent", agentId)
+    } else {
+      args.push("resume", row.source, row.sessionId)
+    }
+    args.push(target === "herdr" ? "--herdr" : "--terminal")
     root.dismiss()
-    Quickshell.execDetached([root.resumeBin, "resume", source, sessionId])
+    Quickshell.execDetached(args)
   }
 
   function copySession() {
@@ -382,10 +467,8 @@ Item {
   }
 
   function openInAgent(agentId) {
-    var row = root.currentRow()
-    if (!row || !agentId) return
-    root.dismiss()
-    Quickshell.execDetached([root.resumeBin, "open", row.source, row.sessionId, "--agent", agentId])
+    if (!agentId) return
+    root.requestLaunch("open", agentId)
   }
 
   function currentRow() {
@@ -469,6 +552,15 @@ Item {
   }
 
   Process {
+    id: herdrStatusProc
+    command: [root.resumeBin, "herdr-status"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.applyHerdrStatus(text)
+    }
+  }
+
+  Process {
     id: copyProc
     command: {
       var row = root.currentRow()
@@ -522,10 +614,15 @@ Item {
       Item {
         id: keyCatcher
         anchors.fill: parent
+        z: root.herdrPromptOpen ? 20 : 0
         focus: true
 
         Keys.priority: Keys.BeforeItem
         Keys.onPressed: function(event) {
+          if (root.herdrPromptOpen) {
+            if (herdrPrompt.handleKey(event)) event.accepted = true
+            return
+          }
           if (event.key === Qt.Key_Escape) {
             if (root.handoffOpen) root.handoffOpen = false
             else if (root.filterText) root.setFilter("")
@@ -588,6 +685,138 @@ Item {
             event.accepted = true
           }
         }
+
+        Item {
+          id: herdrPrompt
+          anchors.fill: parent
+          visible: root.herdrPromptOpen
+          z: 10
+
+          function handleKey(event) {
+            if (!root.herdrPromptOpen) return false
+            if (event.key === Qt.Key_Escape) {
+              root.cancelHerdrPrompt()
+              return true
+            }
+            if (event.key === Qt.Key_Left || event.key === Qt.Key_Right || event.key === Qt.Key_Tab || event.key === Qt.Key_Backtab) {
+              root.herdrPromptIndex = root.herdrPromptIndex === 0 ? 1 : 0
+              return true
+            }
+            if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
+              root.confirmHerdrPrompt()
+              return true
+            }
+            if (event.key === Qt.Key_H) {
+              root.herdrPromptIndex = 1
+              root.confirmHerdrPrompt()
+              return true
+            }
+            if (event.key === Qt.Key_T) {
+              root.herdrPromptIndex = 0
+              root.confirmHerdrPrompt()
+              return true
+            }
+            return true
+          }
+
+          Rectangle {
+            anchors.fill: parent
+            color: root.scrim
+            MouseArea { anchors.fill: parent; onClicked: root.cancelHerdrPrompt() }
+          }
+
+          BorderSurface {
+            width: Math.min(parent.width - Style.space(32), Style.space(390))
+            height: herdrPromptMessage.implicitHeight + Style.space(72)
+            anchors.centerIn: parent
+            color: root.background
+            borderSpec: Border.flat(Color.accent, Style.normalBorderWidth)
+            padding: Style.space(18)
+            radius: root.cornerRadius
+
+            MouseArea { anchors.fill: parent; onClicked: {} }
+
+            Column {
+              anchors.fill: parent
+              anchors.margins: Style.space(4)
+              spacing: Style.space(16)
+
+              Text {
+                id: herdrPromptMessage
+                width: parent.width
+                text: "Herdr is not running. Open this session in Herdr?"
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.title
+                wrapMode: Text.WordWrap
+              }
+
+              Item {
+                width: parent.width
+                height: Style.space(34)
+
+                Row {
+                  anchors.right: parent.right
+                  spacing: Style.space(10)
+
+                BorderSurface {
+                  width: Style.space(96)
+                  height: Style.space(34)
+                  color: root.herdrPromptIndex === 0 ? root.selectedBackground : "transparent"
+                  borderSpec: Border.flat(
+                    root.herdrPromptIndex === 0 ? root.selectedText : Util.alpha(root.foreground, 0.38),
+                    Style.normalBorderWidth)
+                  radius: 0
+                  Text {
+                    anchors.centerIn: parent
+                    text: "Terminal"
+                    color: root.herdrPromptIndex === 0 ? root.selectedText : root.foreground
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                  }
+                  MouseArea {
+                    anchors.fill: parent
+                    hoverEnabled: true
+                    cursorShape: Qt.PointingHandCursor
+                    onEntered: root.herdrPromptIndex = 0
+                    onClicked: {
+                      root.herdrPromptIndex = 0
+                      root.confirmHerdrPrompt()
+                    }
+                  }
+                }
+
+                BorderSurface {
+                  width: Style.space(96)
+                  height: Style.space(34)
+                  color: root.herdrPromptIndex === 1 ? Util.alpha(Color.accent, 0.18) : "transparent"
+                  borderSpec: Border.flat(
+                    root.herdrPromptIndex === 1 ? Color.accent : Util.alpha(Color.accent, 0.56),
+                    Style.normalBorderWidth)
+                  radius: 0
+                  Text {
+                    anchors.centerIn: parent
+                    text: "Herdr"
+                    color: root.herdrPromptIndex === 1 ? Color.accent : root.foreground
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                  }
+                  MouseArea {
+                    anchors.fill: parent
+                    hoverEnabled: true
+                    cursorShape: Qt.PointingHandCursor
+                    onEntered: root.herdrPromptIndex = 1
+                    onClicked: {
+                      root.herdrPromptIndex = 1
+                      root.confirmHerdrPrompt()
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
       }
 
       Column {
@@ -1022,9 +1251,13 @@ Item {
           height: root.footerHeight
           text: root.statusText
             ? root.statusText
-            : (root.handoffOpen
-              ? "Enter:start there  |  ←→:pick agent  |  Esc:cancel"
-              : "Enter:resume  |  Tab:change grouping (" + root.groupBy + ")  |  Ctrl+Y:copy  |  Ctrl+O:open in  |  Esc:close")
+            : (root.herdrPromptOpen
+              ? "Enter:confirm  |  ←→:pick  |  Esc:cancel"
+              : (root.handoffOpen
+                ? "Enter:start there  |  ←→:pick agent  |  Esc:cancel"
+                : (root.herdrRunning
+                  ? "Enter:resume in Herdr  |  Tab:change grouping (" + root.groupBy + ")  |  Ctrl+Y:copy  |  Ctrl+O:open in  |  Esc:close"
+                  : "Enter:resume  |  Tab:change grouping (" + root.groupBy + ")  |  Ctrl+Y:copy  |  Ctrl+O:open in  |  Esc:close")))
           color: root.statusText ? Color.accent : root.foreground
           opacity: root.statusText ? 0.85 : 0.42
           font.family: root.fontFamily

@@ -15,6 +15,7 @@ import datetime as dt
 import json
 import os
 import re
+import shlex
 import shutil
 import sqlite3
 import stat
@@ -1608,6 +1609,446 @@ def resolved_workdir(cwd: str) -> str:
     return str(HOME)
 
 
+# ---------------------------------------------------------------------------
+# Herdr
+# ---------------------------------------------------------------------------
+
+# Kinds `herdr agent start --kind` accepts that this picker can resume.
+HERDR_KINDS: dict[str, str] = {
+    "claude": "claude",
+    "codex": "codex",
+    "grok": "grok",
+    "opencode": "opencode",
+    "pi": "pi",
+    "omp": "omp",
+    "gemini": "gemini",
+    "copilot": "copilot",
+    "cursor": "cursor",
+}
+
+HERDR_CONTEXT_ENV = (
+    "HERDR_ENV",
+    "HERDR_SOCKET_PATH",
+    "HERDR_CLIENT_SOCKET_PATH",
+    "HERDR_WORKSPACE_ID",
+    "HERDR_TAB_ID",
+    "HERDR_PANE_ID",
+    "HERDR_SESSION",
+)
+
+
+def herdr_available() -> bool:
+    return which("herdr") is not None
+
+
+def herdr_env(session: dict[str, Any] | None = None) -> dict[str, str]:
+    env = os.environ.copy()
+    for key in HERDR_CONTEXT_ENV:
+        env.pop(key, None)
+    if session:
+        socket = session.get("socket_path")
+        if socket:
+            env["HERDR_SOCKET_PATH"] = str(socket)
+        name = session.get("name")
+        if name:
+            env["HERDR_SESSION"] = str(name)
+    return env
+
+
+def herdr_sessions() -> list[dict[str, Any]]:
+    if not herdr_available():
+        return []
+    try:
+        proc = subprocess.run(
+            ["herdr", "session", "list", "--json"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=4,
+            env=herdr_env(),
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    if proc.returncode != 0 or not proc.stdout.strip():
+        return []
+    try:
+        data = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        return []
+    rows = data.get("sessions") if isinstance(data, dict) else data
+    return [row for row in rows if isinstance(row, dict)] if isinstance(rows, list) else []
+
+
+def herdr_running_session() -> dict[str, Any] | None:
+    running = [row for row in herdr_sessions() if row.get("running")]
+    if not running:
+        return None
+    for row in running:
+        if row.get("default"):
+            return row
+    return running[0]
+
+
+def herdr_status_payload() -> dict[str, Any]:
+    available = herdr_available()
+    session = herdr_running_session() if available else None
+    return {
+        "available": available,
+        "running": session is not None,
+        "session": str((session or {}).get("name") or ""),
+    }
+
+
+def resolve_launch_target(*, herdr: bool = False, terminal: bool = False) -> str:
+    if terminal:
+        return "terminal"
+    if herdr:
+        return "herdr"
+    if herdr_running_session() is not None:
+        return "herdr"
+    return "terminal"
+
+
+def herdr_kind_for(agent_id: str) -> str | None:
+    return HERDR_KINDS.get(agent_id)
+
+
+def sanitize_herdr_name(*parts: str) -> str:
+    raw = "-".join(part for part in parts if part)
+    text = re.sub(r"[^a-z0-9_-]+", "-", raw.lower()).strip("-")
+    if not text:
+        text = "resume"
+    if not text[0].isalpha():
+        text = "r" + text
+    return text[:32]
+
+
+def unique_herdr_name(base: str, taken: set[str]) -> str:
+    name = (base or "resume")[:32]
+    index = 2
+    while name in taken:
+        suffix = f"-{index}"
+        name = (base or "resume")[: max(1, 32 - len(suffix))] + suffix
+        index += 1
+    return name
+
+
+def _is_relative_to(path: Path, parent: Path) -> bool:
+    try:
+        return path.is_relative_to(parent)
+    except (ValueError, AttributeError):
+        return False
+
+
+def pick_herdr_workspace(workspaces: list[dict[str, Any]], cwd: str) -> dict[str, Any] | None:
+    """Reuse a project workspace; do not dump project sessions into ~."""
+    if not cwd:
+        return None
+    try:
+        target = Path(cwd).expanduser()
+        try:
+            target = target.resolve()
+        except OSError:
+            pass
+    except (OSError, RuntimeError):
+        return None
+
+    home = HOME
+    try:
+        home = HOME.resolve()
+    except OSError:
+        pass
+
+    exact: list[dict[str, Any]] = []
+    contained: list[tuple[int, dict[str, Any]]] = []
+    for workspace in workspaces:
+        worktree = workspace.get("worktree") if isinstance(workspace.get("worktree"), dict) else {}
+        paths: list[Path] = []
+        for key in ("checkout_path", "repo_root"):
+            raw = worktree.get(key)
+            if not raw:
+                continue
+            path = Path(str(raw))
+            try:
+                path = path.resolve()
+            except OSError:
+                pass
+            paths.append(path)
+        for path in paths:
+            if path == target:
+                exact.append(workspace)
+            elif path != home and _is_relative_to(target, path):
+                contained.append((len(path.parts), workspace))
+    if exact:
+        return exact[0]
+    if contained:
+        contained.sort(key=lambda item: -item[0])
+        return contained[0][1]
+    if target == home:
+        for workspace in workspaces:
+            label = str(workspace.get("label") or "")
+            if label in {"~", "home", str(home), str(HOME)}:
+                return workspace
+    return None
+
+
+def herdr_json(
+    args: list[str],
+    session: dict[str, Any] | None,
+    timeout: int = 20,
+) -> dict[str, Any]:
+    try:
+        proc = subprocess.run(
+            ["herdr", *args],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            env=herdr_env(session),
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise RuntimeError(str(error)) from error
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip() or f"herdr {' '.join(args)} failed"
+        raise RuntimeError(detail)
+    if not proc.stdout.strip():
+        return {}
+    try:
+        data = json.loads(proc.stdout)
+    except json.JSONDecodeError as error:
+        raise RuntimeError(f"herdr returned invalid JSON: {error}") from error
+    return data if isinstance(data, dict) else {}
+
+
+def launch_herdr_client() -> None:
+    launcher = which("omarchy-launch-terminal-herdr")
+    if launcher:
+        subprocess.Popen([launcher], start_new_session=True)
+        return
+    argv = build_launch_argv(["herdr"], str(HOME))
+    subprocess.Popen(argv, start_new_session=True)
+
+
+def ensure_herdr_session(start_if_needed: bool) -> dict[str, Any] | None:
+    found = herdr_running_session()
+    if found:
+        return found
+    if not start_if_needed or not herdr_available():
+        return None
+    launch_herdr_client()
+    deadline = time.time() + 20
+    while time.time() < deadline:
+        found = herdr_running_session()
+        if found:
+            time.sleep(0.35)
+            return found
+        time.sleep(0.25)
+    return None
+
+
+def herdr_client_pids() -> list[int]:
+    try:
+        proc = subprocess.run(
+            ["pgrep", "-x", "herdr"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    pids: list[int] = []
+    for token in proc.stdout.split():
+        try:
+            pid = int(token)
+        except ValueError:
+            continue
+        try:
+            cmdline = Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\x00", b" ").decode("utf-8", "replace")
+        except OSError:
+            continue
+        if re.search(r"\bserver\b", cmdline):
+            continue
+        pids.append(pid)
+    return pids
+
+
+def process_ppid(pid: int) -> int:
+    try:
+        for line in Path(f"/proc/{pid}/status").read_text(encoding="utf-8").splitlines():
+            if line.startswith("PPid:"):
+                return int(line.split(":", 1)[1].strip())
+    except (OSError, ValueError):
+        return 0
+    return 0
+
+
+def process_children(pid: int) -> list[int]:
+    children: list[int] = []
+    task = Path(f"/proc/{pid}/task")
+    try:
+        tids = list(task.iterdir())
+    except OSError:
+        return children
+    for tid in tids:
+        try:
+            raw = (tid / "children").read_text(encoding="utf-8")
+        except OSError:
+            continue
+        for token in raw.split():
+            try:
+                child = int(token)
+            except ValueError:
+                continue
+            if child not in children:
+                children.append(child)
+    return children
+
+
+def window_hosts_pids(window_pid: int, wanted: set[int]) -> bool:
+    pending = [window_pid]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if current in seen:
+            continue
+        seen.add(current)
+        if current in wanted:
+            return True
+        pending.extend(process_children(current))
+    return False
+
+
+def focus_window_pid(pid: int) -> bool:
+    hypr = which("hyprctl")
+    if not hypr:
+        return False
+    try:
+        proc = subprocess.run(
+            [hypr, "dispatch", f'hl.dsp.focus({{ window = "pid:{int(pid)}" }})'],
+            check=False,
+            capture_output=True,
+            timeout=3,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return proc.returncode == 0
+
+
+def focus_herdr_client() -> bool:
+    hypr = which("hyprctl")
+    herdr_pids = set(herdr_client_pids())
+    if not hypr or not herdr_pids:
+        return False
+    try:
+        raw = subprocess.run(
+            [hypr, "clients", "-j"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+        clients = json.loads(raw.stdout) if raw.returncode == 0 else []
+    except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError):
+        return False
+    if not isinstance(clients, list):
+        return False
+    windows = {
+        int(client["pid"]): client
+        for client in clients
+        if isinstance(client, dict) and client.get("pid")
+    }
+    for pid in herdr_pids:
+        current = pid
+        seen: set[int] = set()
+        while current and current not in seen:
+            seen.add(current)
+            if current in windows:
+                return focus_window_pid(current)
+            current = process_ppid(current)
+    for window_pid in windows:
+        if window_hosts_pids(window_pid, herdr_pids):
+            return focus_window_pid(window_pid)
+    return False
+
+
+def place_in_herdr(session: dict[str, Any], cwd: str, title: str) -> str:
+    listing = herdr_json(["workspace", "list"], session)
+    workspaces = (listing.get("result") or {}).get("workspaces") or []
+    if not isinstance(workspaces, list):
+        workspaces = []
+    workspaces = [row for row in workspaces if isinstance(row, dict)]
+    match = pick_herdr_workspace(workspaces, cwd)
+    label = clip(title, 40)
+    if match and match.get("workspace_id"):
+        args = ["tab", "create", "--workspace", str(match["workspace_id"]), "--cwd", cwd, "--focus"]
+        if label:
+            args.extend(["--label", label])
+        created = herdr_json(args, session)
+    else:
+        args = ["workspace", "create", "--cwd", cwd, "--focus"]
+        project = Path(cwd).name if cwd else "resume"
+        if project:
+            args.extend(["--label", project])
+        created = herdr_json(args, session)
+    pane_id = str(((created.get("result") or {}).get("root_pane") or {}).get("pane_id") or "")
+    if not pane_id:
+        raise RuntimeError("herdr did not return a pane")
+    return pane_id
+
+
+def start_in_herdr_pane(
+    session: dict[str, Any],
+    pane_id: str,
+    agent_id: str,
+    command: list[str],
+    project: str,
+) -> None:
+    kind = herdr_kind_for(agent_id)
+    if kind:
+        try:
+            listing = herdr_json(["agent", "list"], session)
+            taken = {
+                str(agent.get("agent"))
+                for agent in ((listing.get("result") or {}).get("agents") or [])
+                if isinstance(agent, dict) and agent.get("agent")
+            }
+            name = unique_herdr_name(sanitize_herdr_name(kind, project or "resume"), taken)
+            args = ["agent", "start", name, "--kind", kind, "--pane", pane_id, "--timeout", "45000"]
+            extra = [str(part) for part in command[1:]]
+            if extra:
+                args.extend(["--", *extra])
+            herdr_json(args, session, timeout=50)
+            return
+        except RuntimeError:
+            pass
+    herdr_json(["pane", "run", pane_id, shlex.join([str(part) for part in command])], session)
+
+
+def launch_herdr(command: list[str], cwd: str, agent_id: str, title: str = "") -> int:
+    workdir = resolved_workdir(cwd)
+    try:
+        session = ensure_herdr_session(start_if_needed=True)
+        if session is None:
+            raise RuntimeError("could not start a Herdr session")
+        pane_id = place_in_herdr(session, workdir, title)
+        if herdr_client_pids():
+            focus_herdr_client()
+        else:
+            launch_herdr_client()
+        start_in_herdr_pane(session, pane_id, agent_id, command, Path(workdir).name)
+        return 0
+    except Exception as error:
+        print(f"herdr: {error}", file=sys.stderr)
+        return launch_terminal(command, workdir)
+
+
+def launch_plan(command: list[str], cwd: str, *, agent_id: str, title: str = "", target: str) -> int:
+    if target == "herdr":
+        return launch_herdr(command, cwd, agent_id, title)
+    return launch_terminal(command, cwd)
+
+
 def build_launch_argv(command: list[str], workdir: str) -> list[str]:
     """Open the agent in a terminal whose working directory is the session cwd.
 
@@ -1712,7 +2153,13 @@ def open_command(args: argparse.Namespace) -> int:
         json.dump({"command": argv, "cwd": session.get("cwd") or str(HOME), "agent": target}, sys.stdout)
         sys.stdout.write("\n")
         return 0
-    return launch_terminal(argv, str(session.get("cwd") or HOME))
+    return launch_plan(
+        argv,
+        str(session.get("cwd") or HOME),
+        agent_id=target,
+        title=str(session.get("title") or session.get("id") or target),
+        target=resolve_launch_target(herdr=args.herdr, terminal=args.terminal),
+    )
 
 
 def resume_command(args: argparse.Namespace) -> int:
@@ -1728,7 +2175,19 @@ def resume_command(args: argparse.Namespace) -> int:
         json.dump(plan, sys.stdout, ensure_ascii=False)
         sys.stdout.write("\n")
         return 0
-    return launch_terminal([str(part) for part in plan["command"]], str(plan.get("cwd") or HOME))
+    return launch_plan(
+        [str(part) for part in plan["command"]],
+        str(plan.get("cwd") or HOME),
+        agent_id=args.source,
+        title=str(plan.get("title") or lookup_session(adapter, args.id).get("title") or args.id),
+        target=resolve_launch_target(herdr=args.herdr, terminal=args.terminal),
+    )
+
+
+def herdr_status_command(_args: argparse.Namespace) -> int:
+    json.dump(herdr_status_payload(), sys.stdout, ensure_ascii=False)
+    sys.stdout.write("\n")
+    return 0
 
 
 def sources_command(_args: argparse.Namespace) -> int:
@@ -1772,13 +2231,22 @@ def build_parser() -> argparse.ArgumentParser:
     opener.add_argument("id")
     opener.add_argument("--agent", required=True, help="target agent id, e.g. claude or grok")
     opener.add_argument("--print", action="store_true")
+    opener_target = opener.add_mutually_exclusive_group()
+    opener_target.add_argument("--herdr", action="store_true", help="open in a Herdr session")
+    opener_target.add_argument("--terminal", action="store_true", help="open in a new terminal")
     opener.set_defaults(func=open_command)
 
     resume = sub.add_parser("resume", help="open a session in a terminal")
     resume.add_argument("source")
     resume.add_argument("id")
     resume.add_argument("--print", action="store_true", help="print the launch plan instead of exec")
+    resume_target = resume.add_mutually_exclusive_group()
+    resume_target.add_argument("--herdr", action="store_true", help="open in a Herdr session")
+    resume_target.add_argument("--terminal", action="store_true", help="open in a new terminal")
     resume.set_defaults(func=resume_command)
+
+    herdr_status = sub.add_parser("herdr-status", help="print whether Herdr is installed and running")
+    herdr_status.set_defaults(func=herdr_status_command)
 
     sources = sub.add_parser("sources", help="print discovered session sources")
     sources.set_defaults(func=sources_command)

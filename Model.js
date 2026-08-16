@@ -21,6 +21,20 @@ function emptyPayload() {
   return { schemaVersion: 1, defaultAgent: "", query: "", cwd: "", sources: [], sessions: [] }
 }
 
+function parseHerdrStatus(raw) {
+  try {
+    var data = JSON.parse(String(raw || ""))
+    if (!data || typeof data !== "object") return { available: false, running: false, session: "" }
+    return {
+      available: !!data.available,
+      running: !!data.running,
+      session: String(data.session || "")
+    }
+  } catch (e) {
+    return { available: false, running: false, session: "" }
+  }
+}
+
 function parseOpenPayload(raw) {
   if (!raw) return { query: "", source: "", cwd: "" }
   try {

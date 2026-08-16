@@ -246,6 +246,62 @@ class HandoffTest(unittest.TestCase):
         self.assertIn("hello", text)
 
 
+class HerdrHelpersTest(unittest.TestCase):
+    def test_process_ppid_reads_status(self) -> None:
+        self.assertEqual(R.process_ppid(os.getpid()), os.getppid())
+
+    def test_sanitize_and_unique_names(self) -> None:
+        self.assertEqual(R.sanitize_herdr_name("Grok", "Ivory Tower"), "grok-ivory-tower")
+        self.assertEqual(R.sanitize_herdr_name("123"), "r123")
+        self.assertEqual(R.unique_herdr_name("grok", {"grok", "grok-2"}), "grok-3")
+
+    def test_pick_workspace_prefers_checkout_and_skips_home(self) -> None:
+        workspaces = [
+            {"workspace_id": "wR", "label": "~"},
+            {
+                "workspace_id": "w2",
+                "label": "berserk",
+                "worktree": {
+                    "checkout_path": "/home/thomas/code/berserk",
+                    "repo_root": "/home/thomas/code/berserk",
+                },
+            },
+        ]
+        match = R.pick_herdr_workspace(workspaces, "/home/thomas/code/berserk/apps/docs")
+        self.assertEqual(match["workspace_id"], "w2")
+        self.assertIsNone(R.pick_herdr_workspace(workspaces, "/home/thomas/code/other"))
+        home = R.pick_herdr_workspace(workspaces, str(Path.home()))
+        self.assertEqual(home["workspace_id"], "wR")
+
+    def test_resolve_launch_target(self) -> None:
+        self.assertEqual(R.resolve_launch_target(herdr=False, terminal=True), "terminal")
+        self.assertEqual(R.resolve_launch_target(herdr=True, terminal=False), "herdr")
+
+    def test_herdr_status_when_missing(self) -> None:
+        original = R.which
+        R.which = lambda name: None  # type: ignore[method-assign]
+        try:
+            payload = R.herdr_status_payload()
+        finally:
+            R.which = original  # type: ignore[method-assign]
+        self.assertFalse(payload["available"])
+        self.assertFalse(payload["running"])
+
+    def test_herdr_running_session_prefers_default(self) -> None:
+        original_sessions = R.herdr_sessions
+        R.herdr_sessions = lambda: [  # type: ignore[method-assign]
+            {"name": "scratch", "running": True},
+            {"name": "default", "running": True, "default": True, "socket_path": "/tmp/herdr.sock"},
+            {"name": "dead", "running": False},
+        ]
+        try:
+            session = R.herdr_running_session()
+            self.assertEqual(session["name"], "default")
+            self.assertEqual(R.resolve_launch_target(), "herdr")
+        finally:
+            R.herdr_sessions = original_sessions  # type: ignore[method-assign]
+
+
 class LaunchDirTest(unittest.TestCase):
     def test_resume_plan_keeps_session_cwd(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -266,6 +322,13 @@ class LaunchDirTest(unittest.TestCase):
 
 
 class CliSmokeTest(unittest.TestCase):
+    def test_herdr_status_command(self) -> None:
+        proc = subprocess.run([str(RESUME), "herdr-status"], check=False, capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        data = json.loads(proc.stdout)
+        self.assertIn("available", data)
+        self.assertIn("running", data)
+
     def test_sources_command(self) -> None:
         env = os.environ.copy()
         env["CLAUDE_CONFIG_DIR"] = "/tmp/resume-missing-claude"

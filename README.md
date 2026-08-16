@@ -1,8 +1,8 @@
 # Resume AI Session
 
 A centered, telescope-style overlay for Omarchy that finds past AI coding
-sessions and opens the one you pick in a terminal. `preview.png` is the
-marketplace shot.
+sessions and opens the one you pick in Herdr, or in a terminal if Herdr
+is not in play. `preview.png` is the marketplace shot.
 
 One picker for every agent the machine already knows about: search, preview,
 and resume Claude Code, Codex, Grok, OpenCode, Pi, and anything that registers
@@ -13,9 +13,10 @@ the same way.
 - A fullscreen overlay with a search field, a session list, and a live
   transcript preview
 - Sessions from Claude Code, Codex, Grok, OpenCode, and Pi out of the box
-- Resume in the session's original working directory via
-  `xdg-terminal-exec --dir`, with the same unattended flags `omarchy agent`
-  already uses
+- Resume in the session's original working directory. If a Herdr session is
+  running, Enter opens there. If Herdr is installed but idle, the overlay
+  asks first. Otherwise it uses `xdg-terminal-exec --dir` with the same
+  unattended flags `omarchy agent` already uses
 - Automatic names and default-agent highlighting from Omarchy's existing
   agent registration (usage records + `~/.config/omarchy/defaults/agent`)
 - A drop-in adapter contract so a new agent never needs a plugin patch
@@ -124,8 +125,8 @@ primary filter.
 | Ctrl+Y / Ctrl+C / Shift+Enter | Copy the transcript |
 | Ctrl+O | Open in another installed agent |
 | Ctrl+R | Rescan sessions |
-| Enter | Resume the selected session |
-| Esc | Clear the filter, or close |
+| Enter | Resume the selected session (in Herdr when a session is running) |
+| Esc | Clear the filter, close the Herdr prompt, or close |
 
 Copy puts a pasteable handoff on the clipboard: title, original agent,
 directory, and the conversation labeled User / Assistant. Open-in starts a
@@ -135,6 +136,24 @@ passed as the first prompt; a long one is written owner-only (mode 0600) to
 `~/.cache/omarchy/resume/handoffs/` and removed after 24 hours. The new agent
 is asked to read that file.
 This is not a converted native session — it is a clean continuation prompt.
+
+## Herdr
+
+If `herdr` is on `PATH` and a session is already running, resume and
+open-in land in that session: a matching project workspace gets a new
+tab, otherwise a workspace is created for the session directory. An
+existing Herdr window is focused; a second client is not launched.
+
+If Herdr is installed but no session is running, Enter asks whether to
+start one. **Herdr** launches `omarchy launch terminal herdr` and opens
+the agent there. **Terminal** keeps the previous standalone-window
+behavior. Esc dismisses the prompt without launching anything.
+
+```
+resume herdr-status
+resume resume grok <session-id> --herdr
+resume resume grok <session-id> --terminal
+```
 
 ```
 resume copy grok <session-id>
